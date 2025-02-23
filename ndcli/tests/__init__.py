@@ -107,7 +107,7 @@ def assert_match_table(table, matching_info):
         if len(row) != len(info):
             return False
         for i in range(len(row)):
-            if type(info[i]) == str and info[i] != row[i]:
+            if isinstance(info[i], str) and info[i] != row[i]:
                 return False
             elif re.match(info[i], row[i]) is None:
                 return False
