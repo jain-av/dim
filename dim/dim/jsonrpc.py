@@ -49,8 +49,8 @@ def _check_credentials(username, password):
 def _do_login(authenticated, username, tool):
     if authenticated:
         # Add the user to the database after the first successful login
-        if User.query.filter_by(username=username).count() == 0:
-            db.session.add(User(username))
+        if db.session.query(User).filter_by(username=username).count() == 0:
+            db.session.add(User(username=username))
             db.session.commit()
             logging.debug('Created user %s' % username)
         session.clear()

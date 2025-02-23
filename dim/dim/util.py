@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 from flask_sqlalchemy import get_debug_queries
 from sqlalchemy.orm import class_mapper, defer
+from sqlalchemy import inspect
 
 
 _MAX_LENGTH = 300
@@ -61,7 +62,7 @@ def printquery(statement, bind=None):
     import sqlalchemy.orm
     if isinstance(statement, sqlalchemy.orm.Query):
         if bind is None:
-            bind = statement.session.get_bind(statement._mapper_zero_or_none())
+            bind = statement.session.get_bind()
         statement = statement.statement
     elif bind is None:
         bind = statement.bind

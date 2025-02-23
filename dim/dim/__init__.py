@@ -8,7 +8,7 @@ import sqlalchemy.orm
 import sqlalchemy.pool
 from flask import Flask, g
 from sqlalchemy import event, String
-from sqlalchemy.ext.declarative import declared_attr, declarative_base
+from sqlalchemy.orm import declared_attr, declarative_base, Mapped, mapped_column
 from sqlalchemy.orm import ColumnProperty
 
 from .errors import InvalidParameterError
@@ -77,8 +77,8 @@ def create_app(db_mode: Optional[str] = None, testing: bool = False):
 
 def script_app(*args, **kwargs):
     app = create_app(*args, **kwargs)
-    app.test_request_context().push()
-    return app
+    with app.test_request_context():
+        yield
 
 
 def configure_logging(app):
@@ -132,7 +132,6 @@ class Model(object):
 
 db = flask_sqlalchemy.SQLAlchemy()
 db.Model = declarative_base(cls=Model)
-db.Model.query = flask_sqlalchemy._QueryProperty(db)
 
 
 # set timezone for mysql

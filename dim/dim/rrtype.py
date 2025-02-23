@@ -1,5 +1,3 @@
-
-
 import re
 
 import dns.rdata
@@ -227,7 +225,7 @@ def validate_strings(self, key, value: Union[str, List[str]], **kwargs):
             split_strings.append(s)
     if splits:
         Messages.warn('A TXT record string was longer than 255 characters, it was automatically divided.')
-    return ' '.join('"' + dns.rdata._escapify(s) + '"' for s in split_strings)
+    return ' '.join('"' + dns.rdata.util.as_text(dns.rdata._escapify(s)) + '"' for s in split_strings)
 
 
 def validate_character_string(self, key, value, **kwargs):
@@ -306,7 +304,6 @@ class MX(RRType):
 class NS(RRType):
     fields = ('nsdname', )
     validate = {'nsdname': validate_target}
-
 
 class SRV(RRType):
     fields = ('priority', 'weight', 'port', 'target')

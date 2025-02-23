@@ -84,7 +84,7 @@ def pool_report(
                        or --ripe, but present in a pool. This option is a comma-separated list of nets
                        which can be safely excluded from the report.''',
 )
-def usage_report(pool_regexp: str, arin: str, ripe: str, ignored: Optional[str] = None):
+def usage_report(hosting_pools: str, arin: str, ripe: str, ignored: Optional[str] = None):
     '''Prints IP usage reports'''
 
     def block_list(block_str_list):
@@ -99,11 +99,11 @@ def usage_report(pool_regexp: str, arin: str, ripe: str, ignored: Optional[str] 
         print(str(e))
         return
     print("Global #####################")
-    print(dim.commands.usage_report(pool_regexp, arin + ripe, ignored, warn=False))
+    print(dim.commands.usage_report(hosting_pools, arin + ripe, ignored, warn=False))
     print("\n\nUS #########################")
-    print(dim.commands.usage_report(pool_regexp, arin, ignored, warn=False))
+    print(dim.commands.usage_report(hosting_pools, arin, ignored, warn=False))
     print("\n\nEU #########################")
-    print(dim.commands.usage_report(pool_regexp, ripe, ignored, warn=False))
+    print(dim.commands.usage_report(hosting_pools, ripe, ignored, warn=False))
 
 
 @dim_report.cli.command('update_history')

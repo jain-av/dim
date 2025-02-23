@@ -8,10 +8,11 @@ from dim.rpc import get_user
 from dim.transaction import time_function, transaction
 from math import floor, ceil
 from dim import db
+from sqlalchemy import select
 
 
 def get_user_type(user_type_str: str) -> UserType:
-    user_type = UserType.query.filter_by(name=user_type_str).first()
+    user_type = db.session.execute(select(UserType).filter_by(name=user_type_str)).scalar_one_or_none()
     if user_type is None:
         raise Exception("User type '%s' does not exist" % user_type_str)
     return user_type
@@ -20,7 +21,7 @@ def get_user_type(user_type_str: str) -> UserType:
 @time_function
 @transaction
 def rebuild_tree():
-    for layer3domain in Layer3Domain.query.all():
+    for layer3domain in db.session.execute(select(Layer3Domain)).scalars():
         Ipblock.build_tree_parents(layer3domain, 4)
         Ipblock.build_tree_parents(layer3domain, 6)
 
@@ -67,7 +68,7 @@ def pool_report(pool_name: str, prefix: Optional[int] = None, estimate: int = 30
     except Exception as e:
         return "Missing template: " + str(e)
 
-    pool: Optional[Pool] = Pool.query.filter_by(name=pool_name).first()
+    pool: Optional[Pool] = db.session.execute(select(Pool).filter_by(name=pool_name)).scalar_one_or_none()
     if not pool:
         return "WARNING: Pool %s does not exist." % pool_name
     total_bits = 32 if pool.version == 4 else 128
@@ -124,7 +125,7 @@ def usage_report(hosting_pools, networks, ignored, warn):
     subnet_total = sum(net.numhosts for net in networks)
     subnet_used = used_hosting = wasted_hosting = used_other = wasted_other = 0
     warnings = []
-    for pool in Pool.query.all():
+    for pool in db.session.execute(select(Pool)).scalars():
         if pool.version != 4:
             continue
         used = free = 0

@@ -4,7 +4,7 @@ import uuid
 from functools import wraps
 
 from flask import current_app, g
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.exc import OperationalError
 
 from dim import db
@@ -50,7 +50,8 @@ class LockTimeout(Exception):
 
 
 def get_lock_for_transaction(lock_name, timeout):
-    if not db.session.execute("SELECT GET_LOCK('%s', %d)" % (lock_name, timeout)).scalar():
+    if not db.session.execute(text("SELECT GET_LOCK(:lock_name, :timeout)"),
+                              {"lock_name": lock_name, "timeout": timeout}).scalar():
         raise LockTimeout("Lock timeout")
 
     # RELEASE_LOCK must be called from the same connection.
@@ -62,7 +63,7 @@ def get_lock_for_transaction(lock_name, timeout):
 
     def release_lock(*args):
         if not conn.closed:
-            released = conn.execute("SELECT RELEASE_LOCK('%s')" % lock_name).scalar()
+            released = conn.execute(text("SELECT RELEASE_LOCK(:lock_name)"), {"lock_name": lock_name}).scalar()
             assert released == 1
     event.listen(db.session(), 'after_commit', release_lock)
     event.listen(db.session(), 'after_rollback', release_lock)
@@ -82,7 +83,7 @@ def retryable_transaction(f):
             try:
                 return f(*args, **kwargs)
             except OperationalError as e:
-                if i == (attempts - 1) or all(msg not in e.message for msg in lock_messages_error):
+                if i == (attempts - 1) or all(msg not in e.orig.args[1] for msg in lock_messages_error):
                     raise
                 logging.info('Error processing transaction: %s. Retrying', e)
     return wrapped

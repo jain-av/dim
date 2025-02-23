@@ -5,6 +5,7 @@ from itertools import islice, groupby
 from dim import db
 from dim.ipaddr import IP
 from dim.models import Ipblock, Pool
+from sqlalchemy import select
 
 
 def allocate_ip(pool_or_block):
@@ -27,11 +28,11 @@ def allocate_delegation(pool_or_block, prefix, maxsplit):
 def _allocate_from(pool_or_block, **kwargs):
     if isinstance(pool_or_block, Pool):
         pool = pool_or_block
-        parent_query = Ipblock.query.filter_by(pool=pool, layer3domain=pool.layer3domain)
+        parent_query = select(Ipblock).filter_by(pool=pool, layer3domain=pool.layer3domain)
         strategy = pool.get_attrs().get('allocation_strategy', 'first')
     elif isinstance(pool_or_block, Ipblock):
         block = pool_or_block
-        parent_query = Ipblock.query.filter_by(id=block.id, layer3domain=block.layer3domain)
+        parent_query = select(Ipblock).filter_by(id=block.id, layer3domain=block.layer3domain)
         strategy = block.get_attrs().get('allocation_strategy')
         if strategy is None:
             subnet = block.subnet
@@ -87,11 +88,14 @@ def free_ranges(parent_query):
     Returns the list of ranges representing the free space in `parent_query`
     grouped by parent block.
     '''
-    parents = dict((p.id, IP(int(p.address), p.prefix, p.version)) for p in parent_query.all())
+    results = db.session.execute(parent_query)
+    parents = dict((p.id, IP(int(p.address), p.prefix, p.version)) for p in results.scalars())
     psq = parent_query.subquery()
-    used = db.session.query(psq.c.id, Ipblock.address, Ipblock.prefix)\
-        .outerjoin(Ipblock, Ipblock.parent_id == psq.c.id)\
-        .order_by(psq.c.priority, psq.c.id, Ipblock.address).all()
+    used = db.session.execute(
+        select(psq.c.id, Ipblock.address, Ipblock.prefix)
+        .outerjoin(Ipblock, Ipblock.parent_id == psq.c.id)
+        .order_by(psq.c.priority, psq.c.id, Ipblock.address)
+    ).all()
     result = []
     for pid, children in groupby(used, key=lambda x: x[0]):
         parent = parents[pid]

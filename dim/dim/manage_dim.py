@@ -3,6 +3,7 @@ import uuid
 
 from flask import current_app, g, Blueprint
 import click
+from sqlalchemy import select
 
 import dim.autodns3
 import dim.commands
@@ -35,7 +36,7 @@ def update_validity():
     '''Check for signed zones with less than half of the validity window left and increase the validity period'''
     with current_app.test_request_context():
         g.tid = uuid.uuid4().hex[16:]
-        for zone in dim.models.Zone.query.all():
+        for zone in dim.models.db.session.execute(select(dim.models.Zone)).scalars().all():
             try:
                 if (len(zone.keys) > 0 and
                         (zone.valid_end is None or zone.valid_begin is None or zone.valid_end <= zone.valid_begin or
