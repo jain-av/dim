@@ -1,9 +1,12 @@
 from tests.util import RPCTest
 from dim.models import Zone
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 
 def zone(name):
-    return Zone.query.filter_by(name=name).first()
+    with Session(RPCTest.db.engine) as session:
+        return session.execute(select(Zone).filter_by(name=name)).scalar_one_or_none()
 
 
 class RevzoneTest(RPCTest):

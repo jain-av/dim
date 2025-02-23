@@ -4,10 +4,11 @@ from dim.models import db, Ipblock, IpblockAttr
 from dim.ipaddr import IP
 from dim.errors import InvalidIPError, AlreadyExistsError, InvalidPoolError, InvalidStatusError, DimError
 from tests.util import RPCTest, raises, query_ip
+from sqlalchemy import select
 
 
 def get_ipblock(ip):
-    return query_ip(ip).one()
+    return db.session.execute(query_ip(ip)).scalar_one()
 
 
 def ip_status(l):
@@ -63,26 +64,26 @@ class IpblockTest(RPCTest):
         self.r.ip_free('12.0.0.1')
         assert self.r.ipblock_remove('12.0.0.0/24')
         self.r.ip_mark('12.0.0.1')
-        assert Ipblock.query.count() == 2
-        assert query_ip('12.0.0.0/24').count() == 0
+        assert db.session.execute(select(Ipblock)).rowcount == 2
+        assert db.session.execute(query_ip('12.0.0.0/24')).rowcount == 0
 
         self.r.ipblock_remove('12.0.0.0/16', force=True)
-        assert Ipblock.query.count() == 1
-        assert query_ip('12.0.0.0/16').count() == 0
+        assert db.session.execute(select(Ipblock)).rowcount == 1
+        assert db.session.execute(query_ip('12.0.0.0/16')).rowcount == 0
 
     def test_recursive_delete1(self):
         self.r.ipblock_create('12.0.0.0/16', status='Container')
         self.r.ipblock_create('12.0.0.0/24', status='Container')
         self.r.ip_mark('12.0.0.1')
         self.r.ipblock_remove('12.0.0.0/16', force=True, recursive=True)
-        assert Ipblock.query.count() == 0
+        assert db.session.execute(select(Ipblock)).rowcount == 0
 
     def test_recursive_delete2(self):
         self.r.ipblock_create('12::/16', status='Container')
         self.r.ipblock_create('12::/24', status='Container')
         self.r.ip_mark('12::1')
         self.r.ipblock_remove('12::/24', force=True, recursive=True)
-        assert Ipblock.query.count() == 1
+        assert db.session.execute(select(Ipblock)).rowcount == 1
 
     def test_parents(self):
         self.r.ipblock_create('192.168.0.0/16', status='Container')
@@ -142,7 +143,7 @@ class IpblockTest(RPCTest):
 
         assert self.r.ipblock_remove('12.0.0.0/24')
         assert self.r.ipblock_remove('13.0.0.0/24')
-        assert IpblockAttr.query.count() == 0
+        assert db.session.execute(select(IpblockAttr)).rowcount == 0
         with raises(InvalidIPError):
             self.r.ipblock_get_attrs('12.0.0.0/24')
 

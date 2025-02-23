@@ -1,3 +1,7 @@
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Identity
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.exc import IntegrityError
 from dim import db
 from dim.dns import get_ip_from_ptr_name
 from dim.rrtype import validate_strings
@@ -583,7 +587,7 @@ class TXT(RPCTest):
     def test_parse(self):
         for txt in ('unquoted', '"', '\\"', '\\', '"\\"', '"\\', '"\\0"', '"\\999"', 'a"b"', '"a"b', '"""', '"\\\\\\"'):
             with raises(InvalidParameterError):
-                self.r.rr_create(name='a.test.com.', type='TXT', txt=txt)
+                self.r.rr_create(name='a.test.com.', type='TXT', strings=[txt])
         canonical = {'"simple"': '"simple"',
                      '"ignore" \t\n"whitespace"': '"ignore" "whitespace"',
                      '"regular escape\\100"': '"regular escaped"',
@@ -598,7 +602,7 @@ class TXT(RPCTest):
                      self._simple_quote('a' * 513): ' '.join([self._simple_quote('a' * 255), self._simple_quote('a' * 255), self._simple_quote('a' * 3)])}
         for i, original in enumerate(canonical.keys()):
             rr_name = '%d.test.com.' % i
-            self.r.rr_create(name=rr_name, type='TXT', strings=original)
+            self.r.rr_create(name=rr_name, type='TXT', strings=[original])
             assert self.r.rr_list(rr_name)[0]['value'] == canonical[original]
 
 

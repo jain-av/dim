@@ -5,9 +5,13 @@ from dim.models import db, Pool, Ipblock, PoolAttr, Vlan
 from dim.errors import InvalidVLANError, AlreadyExistsError, InvalidIPError, InvalidStatusError, \
     NotInPoolError, InvalidPriorityError, InvalidParameterError
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 
 def get_pool(name):
-    return Pool.query.filter_by(name=name).first()
+    with Session(db.engine) as session:
+        return session.execute(select(Pool).filter_by(name=name)).scalar_one_or_none()
 
 
 class PoolTest(RPCTest):
@@ -65,37 +69,42 @@ class PoolTest(RPCTest):
         self.r.ipblock_create('12::/32', status='Container')
         self.r.ippool_create('v6')
         self.r.ippool_add_subnet('v6', '12::/64')
-        assert Ipblock.query.count() == 3
+        with Session(db.engine) as session:
+            assert session.execute(select(Ipblock)).rowcount == 3
         assert self.r.ippool_delete('v6', force=True, delete_subnets=True)
 
         self.r.ipblock_create('12.0.0.0/8', status='Container')
         self.r.ippool_create('v4')
         self.r.ippool_add_subnet('v4', '12.0.0.0/23')
-        assert query_ip('12.0.0.0').first().status.name == 'Reserved'
-        assert query_ip('12.0.0.255').first().status.name == 'Reserved'
-        assert query_ip('12.0.1.0').first().status.name == 'Reserved'
-        assert query_ip('12.0.0.255').first().status.name == 'Reserved'
+        with Session(db.engine) as session:
+            assert session.execute(query_ip('12.0.0.0')).scalar().status.name == 'Reserved'
+            assert session.execute(query_ip('12.0.0.255')).scalar().status.name == 'Reserved'
+            assert session.execute(query_ip('12.0.1.0')).scalar().status.name == 'Reserved'
+            assert session.execute(query_ip('12.0.0.255')).scalar().status.name == 'Reserved'
         assert self.r.ippool_delete('v4', force=True, delete_subnets=True)
 
         # .0 and .255 addresses should always be Reserved
         self.r.ippool_create('v4')
         self.r.ippool_add_subnet('v4', '12.0.0.0/23', dont_reserve_network_broadcast=True)
-        assert query_ip('12.0.0.0').first() is None
-        assert query_ip('12.0.0.255').first() is None
-        assert query_ip('12.0.1.0').first() is None
-        assert query_ip('12.0.0.255').first() is None
+        with Session(db.engine) as session:
+            assert session.execute(query_ip('12.0.0.0')).scalar() is None
+            assert session.execute(query_ip('12.0.0.255')).scalar() is None
+            assert session.execute(query_ip('12.0.1.0')).scalar() is None
+            assert session.execute(query_ip('12.0.0.255')).scalar() is None
         assert self.r.ippool_delete('v4', force=True, delete_subnets=True)
 
         self.r.ippool_create('v4')
         self.r.ippool_add_subnet('v4', '12.0.0.64/26')
-        assert query_ip('12.0.0.64').first().status.name == 'Reserved'
-        assert query_ip('12.0.0.127').first().status.name == 'Reserved'
+        with Session(db.engine) as session:
+            assert session.execute(query_ip('12.0.0.64')).scalar().status.name == 'Reserved'
+            assert session.execute(query_ip('12.0.0.127')).scalar().status.name == 'Reserved'
         assert self.r.ippool_delete('v4', force=True, delete_subnets=True)
 
         self.r.ippool_create('v4')
         self.r.ippool_add_subnet('v4', '12.0.0.64/26', dont_reserve_network_broadcast=True)
-        assert query_ip('12.0.0.64').first() is None
-        assert query_ip('12.0.0.127').first() is None
+        with Session(db.engine) as session:
+            assert session.execute(query_ip('12.0.0.64')).scalar() is None
+            assert session.execute(query_ip('12.0.0.127')).scalar() is None
         assert self.r.ippool_delete('v4', force=True, delete_subnets=True)
 
     def test_attrs(self):
@@ -115,20 +124,22 @@ class PoolTest(RPCTest):
 
         assert self.r.ippool_delete('control')
         assert self.r.ippool_delete('pool_attrs')
-        assert PoolAttr.query.count() == 0
+        with Session(db.engine) as session:
+            assert session.execute(select(PoolAttr)).rowcount == 0
 
     def check_ippool_add_subnet(self, pool, subnet, **options):
         self.r.ippool_add_subnet(pool, subnet, **options)
-        pool = Pool.query.filter_by(name=pool).one()
-        subnet = query_ip(subnet).one()
-        gateway = None
-        if 'gateway' in options:
-            gateway = IP(options.get('gateway')).address
-        assert subnet.pool == pool
-        assert subnet.version == pool.version
-        assert subnet.vlan == pool.vlan
-        assert subnet.gateway == gateway
-        self.assertEqual(dict((a.name.name, a.value) for a in subnet.attributes), options.get('attributes', {}))
+        with Session(db.engine) as session:
+            pool_obj = session.execute(select(Pool).filter_by(name=pool)).scalar_one()
+            subnet_obj = session.execute(query_ip(subnet)).scalar_one()
+            gateway = None
+            if 'gateway' in options:
+                gateway = IP(options.get('gateway')).address
+            assert subnet_obj.pool == pool_obj
+            assert subnet_obj.version == pool_obj.version
+            assert subnet_obj.vlan == pool_obj.vlan
+            assert subnet_obj.gateway == gateway
+            self.assertEqual(dict((a.name.name, a.value) for a in subnet_obj.attributes), options.get('attributes', {}))
 
     def test_create_complex(self):
         for prefix in range(12, 17):
@@ -165,9 +176,11 @@ class PoolTest(RPCTest):
         self.r.ippool_create("pool2", vlan=5)
         self.r.ippool_add_subnet('pool2', '16.0.0.0/24')
         self.r.ippool_create("pool", vlan=4)
-        assert Ipblock.query_ip(IP('16.0.0.0/24'), None).one().vlan.vid == 5
+        with Session(db.engine) as session:
+            assert session.execute(Ipblock.query_ip(IP('16.0.0.0/24'), None)).scalar_one().vlan.vid == 5
         self.r.ippool_add_subnet('pool', '16.0.0.0/24', allow_move=True)
-        assert Ipblock.query_ip(IP('16.0.0.0/24'), None).one().vlan.vid == 4
+        with Session(db.engine) as session:
+            assert session.execute(Ipblock.query_ip(IP('16.0.0.0/24'), None)).scalar_one().vlan.vid == 4
 
     def test_list_ippools(self):
         self.r.ipblock_create('20.0.0.0/8', status='Container')

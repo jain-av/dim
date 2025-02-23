@@ -12,6 +12,8 @@ from dim.models.dns import OutputUpdate
 from dim.rpc import TRPC
 from tests.pdns_test import PDNSTest
 from tests.pdns_util import compare_dim_pdns_zones, this_dir, test_pdns_output_process
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 
 def delete_record(rpc, r):
@@ -104,7 +106,7 @@ def run_test(app, zone, pdns_output, db_uri, pdns_ip):
 def import_zone(zone):
     proc = Popen(['ndcli', 'import', 'zone', zone], stdin=PIPE, stdout=PIPE)
     zone_contents = open(this_dir(zone)).read()
-    stdout, stderr = proc.communicate(zone_contents)
+    stdout, stderr = proc.communicate(zone_contents.encode())
     if proc.returncode != 0:
         raise Exception('zone import failed')
 
@@ -121,12 +123,18 @@ class PDNSOutputProcess(object):
     def wait_updates(self, zone):
         '''Wait for all updates to be processed'''
         with test.app.test_request_context():
-            while True:
-                db.session.rollback()
-                if OutputUpdate.query.filter(OutputUpdate.zone_name == zone).count() == 0:
-                    break
-                else:
-                    os.read(self.proc.stdout.fileno(), 1024)
+            engine = create_engine(test.app.config['SQLALCHEMY_DATABASE_URI'])
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            try:
+                while True:
+                    session.rollback()
+                    if session.query(OutputUpdate).filter(OutputUpdate.zone_name == zone).count() == 0:
+                        break
+                    else:
+                        os.read(self.proc.stdout.fileno(), 1024)
+            finally:
+                session.close()
 
 
 if __name__ == '__main__':

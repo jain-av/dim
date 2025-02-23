@@ -13,7 +13,7 @@ class AllocatorTest(RPCTest):
         self.r.ipblock_create('12.0.0.0/8', status='Container')
         self.r.ippool_add_subnet('pool', '12.0.0.0/29')
         assert ips(self.r.ippool_get_delegation('pool', 30, maxsplit=1)) == \
-            set(['12.0.0.2/31', '12.0.0.4/31'])
+            {'12.0.0.2/31', '12.0.0.4/31'}
 
     def test_delegation2(self):
         '''Don't allow hosts to be returned from ippool_get_delegation'''
@@ -40,7 +40,7 @@ class AllocatorTest(RPCTest):
         self.r.ip_mark('12.0.0.28')
         self.r.ip_mark('12.0.0.31')
         assert ips(self.r.ippool_get_delegation('pool', 29, maxsplit=2)) == \
-            set(['12.0.0.16/30', '12.0.0.22/31', '12.0.0.24/31'])
+            {'12.0.0.16/30', '12.0.0.22/31', '12.0.0.24/31'}
 
     def test_delegation4(self):
         # R*__
@@ -105,8 +105,8 @@ class AllocatorTest(RPCTest):
         self.r.ipblock_create('2001::/32', status='Container')
         self.r.ippool_create('pool')
         self.r.ippool_add_subnet('pool', '2001::/64')
-        assert ips(self.r.ippool_get_delegation('pool', 96)) == set(['2001::1:0:0/96'])
-        assert ips(self.r.ippool_get_delegation('pool', 96)) == set(['2001::2:0:0/96'])
+        assert ips(self.r.ippool_get_delegation('pool', 96)) == {'2001::1:0:0/96'}
+        assert ips(self.r.ippool_get_delegation('pool', 96)) == {'2001::2:0:0/96'}
         assert self.r.ipblock_get_ip('2001::1:0:0/96')['ip'] == '2001::1:0:0'
 
     def test_random(self):
@@ -124,7 +124,7 @@ class AllocatorTest(RPCTest):
             ip2 = self.r.ipblock_get_ip(d_ip)['ip']
             assert ip1 < ip2
         assert len(delegations) == 4
-        assert ips(delegations) == set(['12.0.0.32/30', '12.0.0.36/30', '12.0.0.40/30', '12.0.0.44/30'])
+        assert ips(delegations) == {'12.0.0.32/30', '12.0.0.36/30', '12.0.0.40/30', '12.0.0.44/30'}
         assert not self.r.ippool_get_delegation('pool', 30)
 
     def test_random_big(self):
@@ -158,7 +158,7 @@ class AllocatorTest(RPCTest):
         self.r.ippool_add_subnet('pool', '10::/64', dont_reserve_network_broadcast=True)
         assert not self.r.ippool_get_delegation('pool', 64)
         assert ips(self.r.ippool_get_delegation('pool', 64, maxsplit=1)) == \
-            set(['10::/65', '10::8000:0:0:0/65'])
+            {'10::/65', '10::8000:0:0:0/65'}
 
     def test_pool_noversion(self):
         self.r.ippool_create('pool')

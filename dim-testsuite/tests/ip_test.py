@@ -1,17 +1,17 @@
-from dim.ipaddr import IP
+from ipaddress import IPv4Network, IPv4Address
 
 
 def test_mask():
-    ip1 = IP('12.0.0.0/24')
-    assert ip1.hostmask == 0x000000ff
-    assert ip1.netmask == 0xffffff00
+    ip1 = IPv4Network('12.0.0.0/24')
+    assert int(ip1.hostmask) == 0x000000ff
+    assert int(ip1.netmask) == 0xffffff00
 
 
 def test_contains():
-    ip1 = IP('12.0.0.0/25')
-    ip2 = IP('12.0.0.0/24')
-    assert ip1 in ip2
-    assert ip2 not in ip1
-    assert ip1 in ip1
+    ip1 = IPv4Network('12.0.0.0/25')
+    ip2 = IPv4Network('12.0.0.0/24')
+    assert ip1.subnet_of(ip2)
+    assert not ip2.subnet_of(ip1)
+    assert ip1.subnet_of(ip1)
 
-    assert IP('12.0.0.2') in ip1
+    assert IPv4Address('12.0.0.2') in ip1

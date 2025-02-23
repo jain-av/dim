@@ -12,17 +12,19 @@ import threading
 import time
 
 from sqlalchemy import create_engine
+from sqlalchemy import text
 
 from tests.pdns_test import PDNSTest
 
 
 def run_checks(pdns_uri):
-    with create_engine(pdns_uri).begin() as conn:
-        records = conn.execute('select * from records').fetchall()
+    engine = create_engine(pdns_uri)
+    with engine.connect() as conn:
+        records = conn.execute(text('select * from records')).fetchall()
         if len(records) >= 3:
             print(records)
             os.killpg(os.getpgid(0), 9)
-        assert conn.execute('select count(*) from records').scalar() < 3
+        assert conn.execute(text('select count(*) from records')).scalar() < 3
 
 
 def event_generator():

@@ -1,5 +1,5 @@
-from dim.ipaddr import IP
-from dim.iptrie import IPTrie
+from ipaddr import IP
+from iptrie import IPTrie
 
 
 def test_create():
