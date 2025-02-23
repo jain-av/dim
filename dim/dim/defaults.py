@@ -1,8 +1,18 @@
+from sqlalchemy.engine import URL
+import logging, logging.handlers
+
 ### Database
 DB_USERNAME = 'dim'
 DB_PASSWORD = 'dim'
 DB_HOST     = '127.0.0.1'
-SQLALCHEMY_DATABASE_URI = 'mysql://%s:%s@%s:3307/dim' % (DB_USERNAME, DB_PASSWORD, DB_HOST)
+SQLALCHEMY_DATABASE_URI = URL.create(
+    "mysql+pymysql",
+    username=DB_USERNAME,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=3307,
+    database="dim",
+)
 DB_LOCK_TIMEOUT = 120
 
 
@@ -36,7 +46,6 @@ TEMPORARY_SESSION_LIFETIME = 24 * 3600            # 1 day
 REQUESTS_CA_BUNDLE   = '/path/to/ca-bundle.crt'
 
 ### Logging
-import logging, logging.handlers
 LOGGING_LEVEL = logging.INFO
 LOGGING_HANDLER = logging.handlers.SysLogHandler(address='/dev/log', facility='local0')
 #LOGGING_HANDLER = logging.handlers.TimedRotatingFileHandler('/var/log/dim/dim.log', when='W0', backupCount=10)
@@ -54,6 +63,13 @@ DNS_DEFAULT_ZONE_TTL = 86400  # 1 day (Default. TTL)
 
 
 ### Debugging
-SQLALCHEMY_DATABASE_URI_TEST = 'mysql://%s:%s@%s:3307/dim' % (DB_USERNAME, DB_PASSWORD, DB_HOST)
+SQLALCHEMY_DATABASE_URI_TEST = URL.create(
+    "mysql+pymysql",
+    username=DB_USERNAME,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=3307,
+    database="dim",
+)
 SQLALCHEMY_LOG = False
 DEBUG = False

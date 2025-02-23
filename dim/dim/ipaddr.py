@@ -1,6 +1,4 @@
-
-
-from ipaddress import ip_address, IPv4Address, IPv6Address, ip_network
+from ipaddress import ip_address, IPv4Address, IPv6Address, ip_network, IPv4Network, IPv6Network
 from typing import Literal
 
 
@@ -30,7 +28,7 @@ class IP(object):
             else:
                 ip = ip_address(address)
                 self.prefix = ip.max_prefixlen
-            self.address = ip._ip
+            self.address = int(ip)
             self.version = ip.version
         else:
             self.address = address
@@ -56,7 +54,10 @@ class IP(object):
         return not self == other
 
     def label(self, expanded=False):
-        tmp = IPv4Address(self.address) if self.version == 4 else IPv6Address(self.address)
+        if self.version == 4:
+            tmp = IPv4Address(self.address)
+        else:
+            tmp = IPv6Address(self.address)
         if expanded:
             ret = tmp.exploded
         else:
@@ -84,7 +85,7 @@ class IP(object):
 
     @property
     def network(self):
-        return IP(self.address, self.bits, self.version)
+        return IP(self.address & self.netmask, self.bits, self.version)
 
     @property
     def broadcast(self):

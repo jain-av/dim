@@ -1,9 +1,7 @@
-
-
 import logging
 import re
 
-from sqlalchemy import or_, and_, func
+from sqlalchemy import or_, and_, func, select
 from sqlalchemy.orm import aliased
 
 from dim import db
@@ -109,7 +107,7 @@ def get_view(zone, view_name):
         else:
             raise MultipleViewsError('A view must be selected from: %s' % ' '.join(sorted(v.name for v in zone.views)))
     else:
-        view = ZoneView.query.filter_by(zone=zone, name=view_name).first()
+        view = db.session.execute(select(ZoneView).filter_by(zone=zone, name=view_name)).scalar_one_or_none()
         if view is None:
             raise InvalidViewError('Zone %s has no view named %s.' % (zone.name, view_name))
         return view
@@ -118,7 +116,204 @@ def get_view(zone, view_name):
 def get_zone(name, profile):
     zone_name = Zone.to_display_name(name)
     name = Zone.from_display_name(name).lower()
-    q = Zone.query.filter_by(name=name, profile=profile)
+    q = db.session.execute(select(Zone).filter_by(name=name, profile=profile))
+    zone = q.scalar_one_or_none()
+    if zone is None:
+        raise InvalidZoneError("%s %s does not exist" % (ZONE_OBJ_NAME[int(profile)], zone_name))
+    return zone
+
+
+def get_rr_zone(name, zone, profile, notfound_message=True):
+    if zone is None:
+        if not name.endswith('.'):
+            raise InvalidParameterError('Name must be a FQDN')
+        zone = Zone.find(name)
+        if zone is None:
+            if notfound_message:
+                Messages.info('No zone found for %s' % name)
+            return None
+    else:
+        zone = get_zone(zone, profile)
+        if name.endswith('.') and (not name.endswith('.' + zone.name + '.') and name != zone.name + '.'):
+            raise InvalidParameterError('RR name %s not in zone %s' % (name, zone.name))
+    return zone
+
+
+def zone_available_check(zone, profile):
+    zone_name = Zone.from_display_name(zone)
+    parent_zone = Zone.find(zone_name + '.')
+    if parent_zone is not None and zone_name == parent_zone.name:
+        raise AlreadyExistsError("%s %s already exists" % (ZONE_OBJ_NAME[int(parent_zone.profile)], Zone.to_display_name(zone_name)))
+    return parent_zone
+
+
+def rr_delete(name, zone, view, profile, free_ips, references, user, type=None, **kwargs):
+    fqdn = make_fqdn(name, view.zone.name)
+    rrs_query = select(RR).filter_by(name=make_fqdn(name, view.zone.name), view=view)
+    display_query = [fqdn]
+    if type:
+        rrs_query = rrs_query.filter_by(type=type)
+        display_query.append(type)
+        if kwargs:
+            kwargs = RR.validate_args(type, **kwargs)
+            value = RR.get_class(type).value_from_fields(**kwargs)
+            rrs_query = rrs_query.filter_by(value=value)
+            if 'ip' in kwargs:
+                rrs_query = rrs_query.filter_by(ipblock=kwargs['ip'])
+            display_query.append(value)  # this should never be needed
+    rrs = db.session.execute(rrs_query).scalars().all()
+    if len(rrs) > 1:
+        raise DimError('%s is ambiguous' % ' '.join(display_query))
+    elif len(rrs) == 0:
+        raise DimError('%s does not exist' % ' '.join(display_query))
+    delete_with_references(rrs, free_ips=free_ips, references=references, user=user)
+
+
+def check_new_rr(new_rr):
+    '''Check if rr can be created'''
+    if new_rr.type in ['MX', 'NS', 'SRV']:
+        point_to_query = _same_view_or_different_zone(new_rr).filter(RR.name == new_rr.target)
+        point_to_count = db.session.execute(select(RR).from_statement(point_to_query)).scalars().all()
+        if len(point_to_count) > 0:
+            if new_rr.type in ['MX', 'NS'] and db.session.execute(select(RR).from_statement(_same_view_or_different_zone(new_rr).filter(or_(RR.type == 'A', RR.type == 'AAAA')))).scalars().all() == 0:
+                raise InvalidParameterError('The target of %s records must have A or AAAA resource records' % new_rr.type)
+            if new_rr.type == 'SRV' and db.session.execute(select(RR).from_statement(_same_view_or_different_zone(new_rr).filter(or_(RR.type == 'A', RR.type == 'AAAA', RR.type == 'NS')))).scalars().all() == 0:
+                raise InvalidParameterError('The target of %s records must have A, AAAA or NS resource records' % new_rr.type)
+    if new_rr.type == 'CNAME':
+        if new_rr.name == new_rr.view.zone.name + '.':
+            raise InvalidParameterError('It is not allowed to create a CNAME for a zone')
+        if len(db.session.execute(select(RR).from_statement(_same_view_or_different_zone(new_rr)\
+                .filter(or_(RR.name == new_rr.name,
+                            and_(~RR.type.in_(('CNAME', 'PTR')), RR.target == new_rr.name))))).scalars().all()):
+            raise InvalidParameterError('%s cannot be created because other RRs with the same name or target exist' % new_rr)
+    elif new_rr.type == 'PTR':
+        if len(db.session.execute(select(RR).from_statement(_same_view_or_different_zone(new_rr)\
+                .filter(RR.type == 'CNAME').filter(RR.name == new_rr.name))).scalars().all()):
+            raise InvalidParameterError('%s cannot be created because other RRs with the same name exist' % new_rr)
+    else:
+        if len(db.session.execute(select(RR).from_statement(_same_view_or_different_zone(new_rr)\
+                .filter(RR.type == 'CNAME').filter(or_(RR.name == new_rr.name, RR.name == new_rr.target)))).scalars().all()):
+            raise InvalidParameterError('%s cannot be created because a CNAME with the same name exists' % new_rr)
+
+import logging
+import re
+
+from sqlalchemy import or_, and_, func, select
+from sqlalchemy.orm import aliased
+
+from dim import db
+from dim.errors import InvalidParameterError, InvalidZoneError, InvalidViewError, DimError, MultipleViewsError, AlreadyExistsError
+from dim.ipaddr import IP
+from dim.messages import Messages
+from dim.models import Ipblock, RR, Zone, ZoneView, ZoneGroup, Output, OutputUpdate, AccessRight, Layer3Domain
+from dim.util import make_fqdn
+
+
+ZONE_OBJ_NAME = {
+    0: 'Zone',
+    1: 'Zone profile'}
+
+
+def subnet_reverse_zones(subnet):
+    '''
+    :type subnet: Ipblock
+    '''
+    rzones = []
+    subnet_str = IP(int(subnet.address), version=subnet.version).label(expanded=True)
+    if subnet.version == 4:
+        if subnet.prefix < 16:
+            raise ValueError("The prefix %d is too small (the minimum is 16)" % subnet.prefix)
+        raddr = [int(n) for n in list(reversed(subnet_str.split('.')))[1:]]
+        bits = max(0, 24 - subnet.prefix)
+        for i in range(2 ** bits):
+            rzones.append('.'.join([str(n) for n in raddr] + ['in-addr.arpa']))
+            raddr[0] += 1
+    elif subnet.version == 6:
+        # Don't allow prefixes larger than /64
+        prefix = min(subnet.prefix, 64)
+        # fhn = first nibble which has host bits
+        fhn_bits = prefix % 4
+        fhn_number = int(prefix / 4)
+        if fhn_bits == 0:
+            fhn_bits = 4
+            fhn_number -= 1
+        addr = list(reversed(subnet_str.replace(':', '')[:fhn_number + 1]))
+        for i in range(2 ** (4 - fhn_bits)):
+            rzones.append('.'.join(addr + ['ip6.arpa']))
+            addr[0] = '%x' % (int(addr[0], 16) + 1)
+    else:
+        raise ValueError("Unknown IP version")
+    return rzones
+
+
+def guess_revzone(ip):
+    '''
+    :type ip: IP
+    '''
+    ip_str = ip.label(expanded=True)
+    if ip.version == 4:
+        return '.'.join(list(reversed(ip_str.split('.')[:3])) + ['in-addr.arpa'])
+    elif ip.version == 6:
+        digits = ''.join(ip_str.split(':')[:4])
+        return '.'.join(list(reversed(digits)) + ['ip6.arpa'])
+    else:
+        raise ValueError("Unknown IP version")
+
+
+def reverse_zone_profile(ip, layer3domain):
+    for ancestor in Ipblock._ancestors_noparent(ip, layer3domain):
+        profile = ancestor.get_attrs().get('reverse_dns_profile', None)
+        if profile is not None:
+            return profile
+
+
+def get_ptr_name(block):
+    address = block.label(expanded=True)
+    if block.version == 4:
+        return '.'.join(list(reversed(address.split('.'))) + ['in-addr.arpa']) + '.'
+    elif block.version == 6:
+        return '.'.join(list(reversed(address.replace(':', ''))) + ['ip6.arpa']) + '.'
+    else:
+        raise ValueError("Unknown IP version")
+
+
+def get_ip_from_ptr_name(ptr_name, strict=True):
+    if ptr_name.endswith('.in-addr.arpa.'):
+        labels = list(reversed(ptr_name[:-len('.in-addr.arpa.')].split('.')))
+        # remove rfc 2317 subnet markers
+        labels = [p for p in labels if re.match(r'^\d+$', p)]
+        if not strict and len(labels) < 4:
+            labels += ['0'] * (4 - len(labels))
+        if len(labels) == 4:
+            return '.'.join(labels)
+    elif ptr_name.endswith('.ip6.arpa.'):
+        labels = list(reversed(ptr_name[:-len('.ip6.arpa.')].split('.')))
+        labels = [p for p in labels if re.match(r'^[0-9a-fA-F]+$', p)]
+        if not strict and len(labels) < 32:
+            labels += ['0'] * (32 - len(labels))
+        if len(labels) == 32:
+            return ':'.join(''.join(labels[group * 4 + i] for i in range(4))
+                            for group in range(8))
+    raise ValueError('Invalid PTR name')
+
+
+def get_view(zone, view_name):
+    if view_name is None:
+        if len(zone.views) == 1:
+            return zone.views[0]
+        else:
+            raise MultipleViewsError('A view must be selected from: %s' % ' '.join(sorted(v.name for v in zone.views)))
+    else:
+        view = db.session.execute(select(ZoneView).filter_by(zone=zone, name=view_name)).scalar_one_or_none()
+        if view is None:
+            raise InvalidViewError('Zone %s has no view named %s.' % (zone.name, view_name))
+        return view
+
+
+def get_zone(name, profile):
+    zone_name = Zone.to_display_name(name)
+    name = Zone.from_display_name(name).lower()
+    q = db.session.execute(select(Zone).filter_by(name=name, profile=profile)).scalars()
     zone = q.first()
     if zone is None:
         raise InvalidZoneError("%s %s does not exist" % (ZONE_OBJ_NAME[int(profile)], zone_name))
@@ -151,17 +346,17 @@ def zone_available_check(zone, profile):
 
 def rr_delete(name, zone, view, profile, free_ips, references, user, type=None, **kwargs):
     fqdn = make_fqdn(name, view.zone.name)
-    rrs = RR.query.filter_by(name=make_fqdn(name, view.zone.name), view=view)
+    rrs = db.session.execute(select(RR).filter_by(name=make_fqdn(name, view.zone.name), view=view)).scalars()
     display_query = [fqdn]
     if type:
-        rrs = rrs.filter_by(type=type)
+        rrs = rrs.filter(RR.type == type)
         display_query.append(type)
         if kwargs:
             kwargs = RR.validate_args(type, **kwargs)
             value = RR.get_class(type).value_from_fields(**kwargs)
-            rrs = rrs.filter_by(value=value)
+            rrs = rrs.filter(RR.value == value)
             if 'ip' in kwargs:
-                rrs = rrs.filter_by(ipblock=kwargs['ip'])
+                rrs = rrs.filter(RR.ipblock == kwargs['ip'])
             display_query.append(value)  # this should never be needed
     if rrs.count() > 1:
         raise DimError('%s is ambiguous' % ' '.join(display_query))
@@ -208,8 +403,8 @@ def create_single_rr(name, rr_type, zone, view, user, overwrite=False, **kwargs)
     existed = False
     created = True
     name = make_fqdn(name, view.zone.name)
-    rr_query = RR.query.filter(RR.name == name).filter(RR.type == rr_type)\
-        .join(ZoneView).filter(RR.view == view)
+    rr_query = db.session.execute(select(RR).filter(RR.name == name).filter(RR.type == rr_type)\
+        .join(ZoneView).filter(RR.view == view)).scalars()
     new_rr = RR.create(name=name, type=rr_type, view=view, **kwargs)
     rrs = rr_query.all()
     if rrs:
@@ -233,7 +428,7 @@ def create_single_rr(name, rr_type, zone, view, user, overwrite=False, **kwargs)
                     Messages.warn("Not overwriting: %s" % rrs[0])
                 elif rr_type == 'MX' and (new_rr.target == '.' and len(rrs) > 0):
                     raise DimError('Can not create NULL MX record - other MX record already exists')
-                elif rr_type == 'MX' and RR.query.filter(RR.name == new_rr.name, RR.type == 'MX', RR.view == view, RR.target == '.').count() > 0:
+                elif rr_type == 'MX' and db.session.execute(select(RR).filter(RR.name == new_rr.name, RR.type == 'MX', RR.view == view, RR.target == '.')).scalars().count() > 0:
                     raise DimError('Can not create MX record - NULL MX record already exists')
                 else:
                     Messages.warn("The name %s already existed, creating round robin record" % name)
@@ -261,7 +456,7 @@ def create_single_rr(name, rr_type, zone, view, user, overwrite=False, **kwargs)
 
 def _same_view_or_different_zone(rr):
     '''Return other rrs in the same view or different zones'''
-    return RR.query.join(RR.view).filter(RR.id != rr.id).filter(or_(RR.view == rr.view, ZoneView.zone != rr.view.zone))
+    return db.session.execute(select(RR).join(RR.view).filter(RR.id != rr.id).filter(or_(RR.view == rr.view, ZoneView.zone != rr.view.zone))).scalars()
 
 
 def orphaned_references(rr, to_delete=None):
@@ -271,38 +466,39 @@ def orphaned_references(rr, to_delete=None):
         to_delete = [rr]
     same_name_count = len([r for r in to_delete if r.name == rr.name and r.zoneview_id == rr.zoneview_id])
     same_name = aliased(RR)
-    refs = _same_view_or_different_zone(rr)\
+    refs = db.session.execute(select(RR)\
         .filter(RR.target == rr.name).filter(RR.type != 'PTR')\
         .join(same_name, and_(same_name.zoneview_id == rr.zoneview_id,
                               same_name.name == rr.name))\
-        .group_by(*RR.__table__.columns).having(func.count(same_name.id) == same_name_count)
+        .group_by(*RR.__table__.columns).having(func.count(same_name.id) == same_name_count)).scalars()
     if rr.type in ('A', 'AAAA'):
         other_a_records = aliased(RR)
         # reverse records are only deleted when the last forward record is deleted
         # (multiple forward records for the same ip can be created in different views)
         refs = refs.union(
-            RR.query.filter_by(type='PTR', ipblock_id=rr.ipblock_id, target=rr.name)
+            db.session.execute(select(RR)
+            .filter_by(type='PTR', ipblock_id=rr.ipblock_id, target=rr.name)
             .join(other_a_records, and_(other_a_records.name == rr.name,
                                         other_a_records.ipblock_id == rr.ipblock_id,
                                         other_a_records.type.in_(('A', 'AAAA'))))
-            .group_by(*RR.__table__.columns).having(func.count(other_a_records.id) == 1))
+            .group_by(*RR.__table__.columns).having(func.count(other_a_records.id) == 1)).scalars())
         # NS and MX targets must have A/AAAA records
         other_a_count = len([r for r in to_delete if r.name == rr.name and
                              r.zoneview_id == rr.zoneview_id and
                              r.type in ('A', 'AAAA')])
         refs = refs.union(
-            _same_view_or_different_zone(rr)
+            db.session.execute(select(RR)
             .filter(RR.target == rr.name)
             .filter(RR.type.in_(('NS', 'MX')))
             .join(other_a_records, and_(other_a_records.zoneview_id == rr.zoneview_id,
                                         other_a_records.name == rr.name,
                                         other_a_records.type.in_(('A', 'AAAA'))))
-            .group_by(*RR.__table__.columns).having(func.count(other_a_records.id) == other_a_count))
+            .group_by(*RR.__table__.columns).having(func.count(other_a_records.id) == other_a_count)).scalars())
     elif rr.type == 'PTR':
         # forward records
-        refs = refs.union(RR.query
+        refs = refs.union(db.session.execute(select(RR)
                           .filter(RR.type.in_(('A', 'AAAA')))
-                          .filter_by(ipblock_id=rr.ipblock_id, name=rr.target))
+                          .filter_by(ipblock_id=rr.ipblock_id, name=rr.target)).scalars())
     # SRV targets must have A/AAAA/NS records
     if rr.type in ('A', 'AAAA', 'NS'):
         other_records = aliased(RR)
@@ -310,13 +506,13 @@ def orphaned_references(rr, to_delete=None):
                                     r.zoneview_id == rr.zoneview_id and
                                     r.type in ('A', 'AAAA', 'NS')])
         refs = refs.union(
-            _same_view_or_different_zone(rr)
+            db.session.execute(select(RR)
                 .filter(RR.target == rr.name)
                 .filter(RR.type == 'SRV')
                 .join(other_records, and_(other_records.zoneview_id == rr.zoneview_id,
                                           other_records.name == rr.name,
                                           other_records.type.in_(('A', 'AAAA', 'NS'))))
-                .group_by(*RR.__table__.columns).having(func.count(other_records.id) == other_a_and_ns_count))
+                .group_by(*RR.__table__.columns).having(func.count(other_records.id) == other_a_and_ns_count)).scalars())
     return refs
 
 
@@ -330,7 +526,7 @@ def delete_single_rr(rr, user):
     send_delete_event = True
     if rr.type in ('A', 'AAAA'):
         if Layer3Domain.query.count() != 1:
-            other_layer3domain_rrs = RR.query \
+            other_layer3domain_rrs = db.session.execute(select(RR) \
                 .filter_by(view=rr.view, name=rr.name, type=rr.type, value=rr.value) \
                 .filter(RR.ipblock_id != rr.ipblock_id) \
                 .count() > 0
@@ -340,7 +536,7 @@ def delete_single_rr(rr, user):
 
 
 def delete_ipblock_rrs(ipblock_ids, user):
-    rrs = RR.query.filter(RR.ipblock_id.in_(ipblock_ids))
+    rrs = db.session.execute(select(RR).filter(RR.ipblock_id.in_(ipblock_ids))).scalars()
     delete_with_references(rrs, free_ips=True, references='delete', user=user)
 
 
@@ -385,7 +581,6 @@ def delete_with_references(query, free_ips, references, user):
         delete_single_rr(rr, user)
     if free_ips and ipblocks:
         free_ipblocks(ipblocks)
-
 
 def free_ipblocks(ipblocks):
     freed_ipblocks = Ipblock.query.outerjoin(RR, Ipblock.id == RR.ipblock_id)\

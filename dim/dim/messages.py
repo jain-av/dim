@@ -25,6 +25,8 @@ class Messages(list):
     @staticmethod
     def _add(level, message):
         logging.log(logging.INFO, Messages.LEVEL_NAME[level][0] + ': ' + message)
+        if not hasattr(Messages._tlocal, 'messages'):
+            Messages._tlocal.messages = []
         Messages._tlocal.messages.append((level, message))
 
     @staticmethod
@@ -50,14 +52,20 @@ class Messages(list):
 
     @staticmethod
     def get():
+        if not hasattr(Messages._tlocal, 'messages'):
+            Messages._tlocal.messages = []
         return Messages._tlocal.messages
 
     @staticmethod
     def save():
         '''Save a copy of the current message list'''
+        if not hasattr(Messages._tlocal, 'messages'):
+            Messages._tlocal.messages = []
         Messages._tlocal.saved_messages = copy.copy(Messages._tlocal.messages)
 
     @staticmethod
     def restore():
         '''Overwrite the current message list with the contents of the save()d message list'''
+        if not hasattr(Messages._tlocal, 'saved_messages'):
+            Messages._tlocal.saved_messages = []
         Messages._tlocal.messages = copy.copy(Messages._tlocal.saved_messages)

@@ -1,5 +1,3 @@
-
-
 import datetime
 import collections
 import logging
@@ -12,7 +10,7 @@ from flask import current_app as app, g
 from sqlalchemy import between, and_, or_, not_, select, String, desc
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import aliased, joinedload, contains_eager
-from sqlalchemy.orm.session import make_transient
+from sqlalchemy.orm import make_transient
 from sqlalchemy.sql.expression import literal, func, FunctionElement, distinct
 
 import dim.dns
@@ -121,9 +119,10 @@ class RPC(object):
         self.user.can_create_groups()
         if department_number is not None:
             group = _check_department_number(department_number)
-        if Group.query.filter_by(name=group).count():
+        if db.session.execute(select(Group).filter_by(name=group)).scalar():
             raise AlreadyExistsError("A group named '%s' already exists" % group)
         db.session.add(Group(name=group, department_number=department_number))
+        db.session.flush()
 
     @updating
     def group_set_department_number(self, group, department_number):
@@ -134,12 +133,14 @@ class RPC(object):
                 _check_department_number(department_number)
             group.department_number = department_number
             record_history(group, action='department_number', department_number=department_number)
+        db.session.flush()
 
     @updating
     def group_delete(self, group):
         group = get_group(group)
         self.user.can_edit_group(group)
         db.session.delete(group)
+        db.session.flush()
 
     @updating
     def group_rename(self, group, new_name):
@@ -147,6 +148,7 @@ class RPC(object):
         self.user.can_edit_group(group)
         group.name = new_name
         group.update_modified()
+        db.session.flush()
 
     @readonly
     def group_get_attrs(self, group):
@@ -162,7 +164,7 @@ class RPC(object):
 
     @readonly
     def group_list(self):
-        return [group.name for group in Group.query.order_by(Group.name)]
+        return [group.name for group in db.session.execute(select(Group).order_by(Group.name)).scalars()]
 
     @updating
     def group_add_user(self, group, user):
@@ -170,11 +172,12 @@ class RPC(object):
         self.user.can_edit_group(group)
         user = get_user(user)
         # Check if this user already gets zone_create from another user-group
-        would_get_zone_create = GroupRight.query.filter_by(group=group).join(AccessRight).filter_by(
-            access='zone_create').count() != 0
+        would_get_zone_create = db.session.execute(select(GroupRight).filter_by(group=group).join(AccessRight).filter_by(
+            access='zone_create')).scalar() is not None
         if would_get_zone_create and user.has_any_access([('zone_create', None)]):
             raise InvalidParameterError('An user can be granted the zone_create right from a single user-group')
         group.users.add(user)
+        db.session.flush()
 
     @updating
     def group_remove_user(self, group, user):
@@ -183,12 +186,14 @@ class RPC(object):
         user = get_user(user)
         if user in group.users:
             group.remove_user(user)
+        db.session.flush()
 
     @updating
     def group_grant_access(self, group, access, object=None):
         group = get_group(group)
         self.user.can_grant_access(group, access)
         _group_grant_access(group, access, object)
+        db.session.flush()
 
     @updating
     def group_revoke_access(self, group, access, object=None):
@@ -197,11 +202,13 @@ class RPC(object):
         rights = get_rights(access, object)
         for (access, object) in rights:
             object_id, object_class = get_object_id_class(access, object)
-            ar = AccessRight.query.filter_by(access=access,
+            stmt = select(AccessRight).filter_by(access=access,
                                              object_id=object_id,
-                                             object_class=object_class).first()
+                                             object_class=object_class)
+            ar = db.session.execute(stmt).scalar_one_or_none()
             if ar and ar in group.rights:
                 group.rights.remove(ar)
+        db.session.flush()
 
     @readonly
     def user_get_groups(self, user):
@@ -211,15 +218,16 @@ class RPC(object):
     @readonly
     def user_list(self, include_groups=False):
         if include_groups:
-            query = User.query.options(joinedload(*User.groups.attr))
+            query = select(User).options(joinedload(User.groups))
         else:
-            query = User.query
+            query = select(User)
         query = query.order_by(User.username)
+        result = db.session.execute(query).scalars()
         if include_groups:
             return [dict(name=user.username, groups=[group.name for group in user.groups])
-                    for user in query]
+                    for user in result]
         else:
-            return [dict(name=user.username) for user in query]
+            return [dict(name=user.username) for user in result]
 
     @readonly
     def user_get_attrs(self, username):
@@ -244,13 +252,14 @@ class RPC(object):
     def user_set_preferences(self, preferences):
         user = get_user(self.username)
         user.preferences = json.dumps(preferences)
+        db.session.flush()
 
     @readonly
     def group_get_users(self, group, include_ldap=False):
         group = get_group(group)
         if not include_ldap:
             return [user.username for user in group.users]
-        memberships = GroupMembership.query.filter_by(group=group).all()
+        memberships = db.session.execute(select(GroupMembership).filter_by(group=group)).scalars().all()
         return [{'username': m.user.username,
                  'ldap_cn': m.user.ldap_cn,
                  'ldap_uid': m.user.ldap_uid,
@@ -259,40 +268,40 @@ class RPC(object):
     @readonly
     def group_get_access(self, group):
         group = get_group(group)
-        pools = db.session.query(Pool.name.distinct())\
+        pools = db.session.execute(select(Pool.name.distinct())
             .join(AccessRight, and_(AccessRight.access == 'allocate',
                                     AccessRight.object_class == 'Ippool',
-                                    AccessRight.object_id == Pool.id))\
-            .join(GroupRight).filter(GroupRight.group == group)\
-            .order_by(Pool.name)
-        views = db.session.query(Zone, ZoneView.name, AccessRight.access)\
-            .join(ZoneView)\
+                                    AccessRight.object_id == Pool.id))
+            .join(GroupRight).filter(GroupRight.group == group)
+            .order_by(Pool.name)).scalars()
+        views = db.session.execute(select(Zone, ZoneView.name, AccessRight.access)
+            .join(ZoneView)
             .join(AccessRight, and_(or_(AccessRight.access == 'create_rr', AccessRight.access == 'delete_rr'),
                                     AccessRight.object_class == 'ZoneView',
-                                    AccessRight.object_id == ZoneView.id))\
-            .join(GroupRight).filter(GroupRight.group == group)\
-            .order_by(AccessRight.access, Zone.name, ZoneView.name)
-        zones = db.session.query(Zone.name)\
+                                    AccessRight.object_id == ZoneView.id))
+            .join(GroupRight).filter(GroupRight.group == group)
+            .order_by(AccessRight.access, Zone.name, ZoneView.name)).all()
+        zones = db.session.execute(select(Zone.name)
             .join(AccessRight, and_(AccessRight.access == 'zone_admin',
                                     AccessRight.object_class == 'Zone',
-                                    AccessRight.object_id == Zone.id)) \
-            .join(GroupRight).filter(GroupRight.group == group) \
-            .order_by(Zone.name)
-        ret = [['allocate', pool[0]] for pool in pools]
-        ret += [['zone_admin', z[0]] for z in zones]
+                                    AccessRight.object_id == Zone.id))
+            .join(GroupRight).filter(GroupRight.group == group)
+            .order_by(Zone.name)).scalars()
+        ret = [['allocate', pool] for pool in pools]
+        ret += [['zone_admin', z] for z in zones]
         ret += [[view[2], _zone_view_display_string(view[0], view[1])] for view in views]
         ret += [[ar.access, ar.object_class] for ar in group.rights if ar.object_class == 'all']
         return ret
 
     @readonly
     def department_list(self, unused=True):
-        used = db.session.query(Group.department_number).filter(Group.department_number != None)  # noqa
+        used = db.session.execute(select(Group.department_number).filter(Group.department_number != None)).scalars()  # noqa
         return [{'name': d.name, 'department_number': d.department_number}
-                for d in Department.query.filter(Department.department_number.notin_(used)).all()]
+                for d in db.session.execute(select(Department).filter(Department.department_number.notin_(used))).scalars()]
 
     @readonly
     def department_number(self, name):
-        dept = Department.query.filter(Department.name == name).first()
+        dept = db.session.execute(select(Department).filter(Department.name == name)).scalar_one_or_none()
         if dept:
             return dept.department_number
         else:
@@ -303,7 +312,7 @@ class RPC(object):
         self.user.can_network_admin()
         if name == "all":
             raise InvalidParameterError("Name 'all' is reserved")
-        if Layer3Domain.query.filter_by(name=name).count():
+        if db.session.execute(select(Layer3Domain).filter_by(name=name)).scalar_one_or_none():
             raise AlreadyExistsError("A layer3domain named '%s' already exists" % name)
         if type in Layer3Domain.TYPES:
             for attr_name in Layer3Domain.TYPES[type]:
@@ -355,7 +364,7 @@ class RPC(object):
     @readonly
     def layer3domain_list(self):
         layer3domains = []
-        for layer3domain in Layer3Domain.query.all():
+        for layer3domain in db.session.execute(select(Layer3Domain)).scalars():
             l3d = dict(name=layer3domain.name, type=layer3domain.type, comment=layer3domain.comment)
             if layer3domain.type == Layer3Domain.VRF:
                 l3d['properties'] = dict(rd=layer3domain.display_rd)
@@ -366,9 +375,9 @@ class RPC(object):
     def layer3domain_delete(self, name):
         self.user.can_network_admin()
         layer3domain = get_layer3domain(name)
-        if Pool.query.filter_by(layer3domain=layer3domain).count() > 0:
+        if db.session.execute(select(Pool).filter_by(layer3domain=layer3domain)).scalars():
             raise DimError('layer3domain %s still contains pools' % layer3domain.name)
-        if Ipblock.query.filter_by(layer3domain=layer3domain).count() > 0:
+        if db.session.execute(select(Ipblock).filter_by(layer3domain=layer3domain)).scalars():
             raise DimError('layer3domain %s still contains objects' % layer3domain.name)
         db.session.delete(layer3domain)
 
@@ -377,20 +386,20 @@ class RPC(object):
         self.user.can_network_admin()
         layer3domain = get_layer3domain(old_name)
         layer3domain.name = new_name
-        views = ZoneView.query.filter_by(name=old_name).join(Zone).filter(Zone.profile == False,
+        views = db.session.execute(select(ZoneView).filter_by(name=old_name).join(Zone).filter(Zone.profile == False,
                                                                           or_(Zone.name.endswith('.in-addr.arpa'),
-                                                                              Zone.name.endswith('.ip6.arpa'))).all()
+                                                                              Zone.name.endswith('.ip6.arpa')))).scalars()
         for view in views:
             view.name = new_name
 
     @readonly
     def ippool_get_access(self, pool):
-        rights = db.session.query(AccessRight.access, Group.name)\
-            .join(Pool, AccessRight.object_id == Pool.id)\
-            .join(GroupRight).join(Group)\
-            .filter(Pool.name == pool)\
-            .filter(AccessRight.object_class == 'Ippool')\
-            .order_by(Group.name)
+        rights = db.session.execute(select(AccessRight.access, Group.name)
+            .join(Pool, AccessRight.object_id == Pool.id)
+            .join(GroupRight).join(Group)
+            .filter(Pool.name == pool)
+            .filter(AccessRight.object_class == 'Ippool')
+            .order_by(Group.name)).all()
         return [{'action': r[0],
                  'group': r[1],
                  'object': pool}
@@ -398,19 +407,20 @@ class RPC(object):
 
     @readonly
     def zone_get_access(self, zone, view=None):
-        query = db.session.query(AccessRight.access, Zone, ZoneView.name, Group.name)\
-            .join(ZoneView, AccessRight.object_id == ZoneView.id)\
-            .join(Zone)\
-            .join(GroupRight).join(Group)\
-            .filter(Zone.name == zone)\
-            .filter(AccessRight.object_class == 'ZoneView')\
+        query = select(AccessRight.access, Zone, ZoneView.name, Group.name) \
+            .join(ZoneView, AccessRight.object_id == ZoneView.id) \
+            .join(Zone) \
+            .join(GroupRight).join(Group) \
+            .filter(Zone.name == zone) \
+            .filter(AccessRight.object_class == 'ZoneView') \
             .order_by(Zone.name, ZoneView.name, Group.name, AccessRight.access)
         if view is not None:
             query = query.filter(ZoneView.name == view)
+        rights = db.session.execute(query).all()
         return [{'action': r[0],
                  'group': r[3],
                  'object': _zone_view_display_string(r[1], r[2])}
-                for r in query]
+                for r in rights]
 
     @updating
     def ipblock_create(self, block_str, attributes=None, status='Container', disallow_children=False,
@@ -419,24 +429,23 @@ class RPC(object):
             raise InvalidParameterError('Use ippool_add_subnet to create subnets')
 
         def find_parent():
-            parents = Ipblock._ancestors_noparent_query(parse_ip(block_str), None) \
-                .filter_by(status=get_status('Container')).all()
+            parents = db.session.execute(Ipblock._ancestors_noparent_query(parse_ip(block_str), None)
+                .filter_by(status=get_status('Container'))).scalars().all()
             if parents and all([p.layer3domain == parents[0].layer3domain for p in parents]):
                 return parents[0].layer3domain
 
         layer3domain = _get_layer3domain_arg(layer3domain, options,
                                             guess_function=find_parent if status == 'Container' and parse_ip(block_str).prefix !=0  else None)
         ip = check_ip(parse_ip(block_str), layer3domain, options)
-        ipblock = Ipblock.query_ip(ip, layer3domain).first()
+        ipblock = db.session.execute(select(Ipblock).where(Ipblock.address == ip.address, Ipblock.prefix == ip.prefix, Ipblock.version == ip.version, Ipblock.layer3domain == layer3domain)).scalar_one_or_none()
         pool = self._can_change_ip(ipblock or ip, layer3domain=layer3domain)
         if ipblock:
             raise AlreadyExistsError("%s already exists in layer3domain %s with status %s" % (
                 ipblock, ipblock.layer3domain.name, ipblock.status.name))
         if disallow_children:
-            if Ipblock.query\
-                    .filter(inside(Ipblock.address, ip))\
-                    .filter_by(layer3domain=layer3domain)\
-                    .count():
+            if db.session.execute(select(Ipblock)
+                    .filter(inside(Ipblock.address, ip))
+                    .filter_by(layer3domain=layer3domain)).scalars().count():
                 raise HasChildrenError("%s from layer3domain %s has children" % (ip, layer3domain.name))
         args = dict(address=ip.address,
                     prefix=ip.prefix,
@@ -458,9 +467,9 @@ class RPC(object):
         block = check_block(get_block(block_str, layer3domain), layer3domain, options)
         pool = self._can_change_ip(block)
         if not force:
-            if block.children\
-                    .join(IpblockStatus)\
-                    .filter(~IpblockStatus.name.in_(['Available', 'Reserved'])).count():
+            if db.session.query(Ipblock).filter(Ipblock.id == block.id). \
+                    join(IpblockStatus).filter(~IpblockStatus.name.in_(['Available', 'Reserved'])). \
+                    join(Ipblock, Ipblock.parent_id == block.id).count() > 0:
                 raise DimError("%s %s from layer3domain %s still contains objects" % (
                     block.status.name, block_str, layer3domain.name))
         if block.pool:
@@ -480,7 +489,7 @@ class RPC(object):
         else:
             if block.is_host:
                 delete_ipblock_rrs([block.id], user=self.user)
-            block.delete()
+            db.session.delete(block)
             if block.status.name == 'Subnet':
                 for rip in subnet_reserved_ips(block.ip, False,False):
                     free_if_reserved(rip, layer3domain)
@@ -501,7 +510,7 @@ class RPC(object):
         if not isinstance(ipblock, Ipblock):
             ip = parse_ip(ipblock)
             layer3domain = _get_layer3domain_arg(layer3domain)
-            ipblock = Ipblock.query_ip(ip, layer3domain).first()
+            ipblock = db.session.execute(select(Ipblock).filter(Ipblock.address == ip.address, Ipblock.prefix == ip.prefix, Ipblock.version == ip.version, Ipblock.layer3domain == layer3domain)).scalar_one_or_none()
         else:
             ip = ipblock.ip
             layer3domain = ipblock.layer3domain
@@ -542,7 +551,7 @@ class RPC(object):
                 if zone:
                     attrs['reverse_zone'] = zone.name
                     if ipblock:
-                        ptr = db.session.query(RR.target).filter_by(type='PTR', ipblock_id=ipblock.id).first()
+                        ptr = db.session.execute(select(RR.target).filter_by(type='PTR', ipblock_id=ipblock.id)).scalar_one_or_none()
                         if ptr:
                             attrs['ptr_target'] = ptr.target
         return attrs
@@ -557,17 +566,16 @@ class RPC(object):
         if block.status.name != 'Container':
             raise DimError('block is not a container')
 
-        if db.session.query(Ipblock). \
+        if db.session.execute(select(Ipblock). \
                 filter(Ipblock.address == block.address). \
-                filter(Ipblock.layer3domain == to_layer3domain). \
-                count() > 0:
+                filter(Ipblock.layer3domain == to_layer3domain)).scalar_one_or_none() is not None:
             raise DimError('container %s already exists in layer3domain %s' % (block.ip, to_layer3domain.name))
 
         # fix all pools first
-        pools = db.session.query(Ipblock). \
+        pools = db.session.execute(select(Ipblock). \
                 join(IpblockStatus).filter(IpblockStatus.name != 'Static'). \
                 filter(Ipblock.parent == block). \
-                filter(Ipblock.ippool_id is not None).all()
+                filter(Ipblock.ippool_id.isnot(None))).scalars().all()
         if block.parent is None and len(pools) > 0:
             raise DimError('block has no parent but pools that need reassignment')
         for pool in pools:
@@ -575,8 +583,8 @@ class RPC(object):
             pool.parent = block.parent
 
         # move all static IPs in container to the new layer3domain
-        ips = db.session.query(Ipblock).filter(Ipblock.parent==block). \
-                join(IpblockStatus).filter(IpblockStatus.name == 'Static').all()
+        ips = db.session.execute(select(Ipblock).filter(Ipblock.parent==block). \
+                join(IpblockStatus).filter(IpblockStatus.name == 'Static')).scalars().all()
         block.layer3domain = to_layer3domain
         for ip in ips:
             Messages.info("moving static ip %s to layer3domain %s" % (ip.ip, to_layer3domain.name))
@@ -618,7 +626,7 @@ class RPC(object):
         if pool:
             pool = get_pool(pool)
         check_ip(ip, layer3domain, options)
-        block = Ipblock.query_ip(ip, layer3domain).first()
+        block = db.session.execute(select(Ipblock).filter(Ipblock.address == ip.address, Ipblock.prefix == ip.prefix, Ipblock.version == ip.version, Ipblock.layer3domain == layer3domain)).scalar_one_or_none()
         self._can_change_ip(block or ip, pool=pool, layer3domain=layer3domain)
         freed = None
         if block:
@@ -626,7 +634,7 @@ class RPC(object):
                 freed = -1
             else:
                 delete_ipblock_rrs([block.id], user=self.user)
-                block.delete()
+                db.session.delete(block)
                 freed = 1
             if freed == 0 or freed == 1:
                 if pool is not None:
@@ -647,7 +655,7 @@ class RPC(object):
                                  limit=limit, attributes=attributes, offset=offset)
         else:
             ips = []
-            for layer3domain in Layer3Domain.query.all():
+            for layer3domain in db.session.execute(select(Layer3Domain)).scalars():
                 layer_ips = self._ip_list(layer3domain, type=type, pool=pool, vlan=vlan, cidr=cidr, full=full,
                                           after=after, limit=limit, attributes=attributes, offset=offset)
                 for layer_ip in layer_ips:
@@ -668,7 +676,7 @@ class RPC(object):
             total_count = self._ip_list_count(layer3domain, type=type, pool=pool, vlan=vlan, cidr=cidr, full=full)
         else:
             total_count = 0
-            for layer3domain in Layer3Domain.query.all():
+            for layer3domain in db.session.execute(select(Layer3Domain)).scalars():
                 total_count += self._ip_list_count(layer3domain, type=type, pool=pool, vlan=vlan, cidr=cidr, full=full)
         return {'count': total_count, 'data': ips}
 
@@ -684,17 +692,17 @@ class RPC(object):
         if after is not None:
             after = parse_ip(after)
 
-        parents = db.session.query(Ipblock.address, Ipblock.prefix, Ipblock.version) \
+        stmt = select(Ipblock.address, Ipblock.prefix, Ipblock.version) \
             .filter_by(layer3domain=layer3domain) \
             .join(IpblockStatus).filter_by(name='Subnet')
         if pool is not None:
-            parents = parents.join(Pool).filter(Pool.name.like(make_wildcard(pool)))
+            stmt = stmt.join(Pool).filter(Pool.name.like(make_wildcard(pool)))
         if vlan is not None:
             vlan = validate_vlan(vlan)
-            pools = db.session.query(Pool.name).join(Vlan).filter(Vlan.vid == vlan)
-            if pools.count() > 1:
-                raise DimError('Multiple pools with vlan %d exist: %s' % (vlan, ' '.join(sorted([p.name for p in pools.all()]))))
-            parents = parents.join(Vlan).filter(Vlan.vid == vlan)
+            pools = db.session.execute(select(Pool.name).join(Vlan).filter(Vlan.vid == vlan)).scalars().all()
+            if len(pools) > 1:
+                raise DimError('Multiple pools with vlan %d exist: %s' % (vlan, ' '.join(sorted(pools))))
+            stmt = stmt.join(Vlan).filter(Vlan.vid == vlan)
         if cidr is not None:
             cidr = parse_ip(cidr)
             parents = [[cidr.address, cidr.prefix, cidr.version]]
@@ -703,7 +711,8 @@ class RPC(object):
             if offset is not None and not cidr.is_host:
                 raise InvalidParameterError('the offset option works only with host cidrs')
         else:
-            parents = parents.order_by(Ipblock.version, Ipblock.address).all()
+            stmt = stmt.order_by(Ipblock.version, Ipblock.address)
+            parents = db.session.execute(stmt).all()
 
         # The code below is run only when the offset option is used
         # The offset option was added specifically for the old dim frontend
@@ -713,8 +722,8 @@ class RPC(object):
             offset = int(offset)
             start_block = None
             for (pos, (address, prefix, version)) in enumerate(parents):
-                block = db.session.query(Ipblock).filter_by(address=int(address), prefix=prefix, version=version,
-                                                            layer3domain=layer3domain).one()
+                block = db.session.execute(select(Ipblock).filter_by(address=int(address), prefix=prefix, version=version,
+                                                            layer3domain=layer3domain)).scalar_one()
                 if type == 'all':
                     size = block.total
                 elif type == 'free':
@@ -767,9 +776,9 @@ class RPC(object):
             # TODO this doesn't work if block is not inside a subnet
             if attributes is not None and 'pool' in attributes:
                 pool_name = None
-                ipblock = Ipblock.query.filter_by(address=address, prefix=prefix, version=version,
+                ipblock = db.session.execute(select(Ipblock).filter_by(address=address, prefix=prefix, version=version,
                                                   layer3domain=layer3domain) \
-                    .join(IpblockStatus).filter_by(name='Subnet').first()
+                    .join(IpblockStatus).filter_by(name='Subnet')).scalar_one_or_none()
                 if ipblock is not None and ipblock.pool:
                     pool_name = ipblock.pool.name
                 else:
@@ -796,22 +805,22 @@ class RPC(object):
         if int(cidr is not None) + int(pool is not None) + int(vlan is not None) > 1:
             raise InvalidParameterError('pool, cidr, vlan and owner parameters are mutually exclusive')
 
-        parents = db.session.query(Ipblock.address, Ipblock.prefix, Ipblock.version) \
+        stmt = select(Ipblock.address, Ipblock.prefix, Ipblock.version) \
             .filter_by(layer3domain=layer3domain) \
             .join(IpblockStatus).filter_by(name='Subnet')
         if pool is not None:
-            parents = parents.join(Pool).filter(Pool.name.like(make_wildcard(pool)))
+            stmt = stmt.join(Pool).filter(Pool.name.like(make_wildcard(pool)))
         if vlan is not None:
             vlan = validate_vlan(vlan)
-            pools = db.session.query(Pool.name).join(Vlan).filter(Vlan.vid == vlan)
-            if pools.count() > 1:
-                raise DimError('Multiple pools with vlan %d exist: %s' % (vlan, ' '.join(sorted([p.name for p in pools.all()]))))
-            parents = parents.join(Vlan).filter(Vlan.vid == vlan)
+            pools = db.session.execute(select(Pool.name).join(Vlan).filter(Vlan.vid == vlan)).scalars().all()
+            if len(pools) > 1:
+                raise DimError('Multiple pools with vlan %d exist: %s' % (vlan, ' '.join(sorted(pools))))
+            stmt = stmt.join(Vlan).filter(Vlan.vid == vlan)
         if cidr is not None:
             cidr = parse_ip(cidr)
             parents = [[cidr.address, cidr.prefix, cidr.version]]
         else:
-            parents = parents.all()
+            parents = db.session.execute(stmt).all()
 
         ips_count = 0
         for address, prefix, version in parents:
@@ -844,10 +853,10 @@ class RPC(object):
             if block.pool:
                 item['pool'] = block.pool.name
             if item['status'] == 'Container':
-                children = Ipblock.query.filter_by(parent_id=block.id, layer3domain=block.layer3domain)\
+                children = db.session.execute(select(Ipblock).filter_by(parent_id=block.id, layer3domain=block.layer3domain)\
                                         .options(joinedload('pool'))\
                                         .options(joinedload('attributes'))\
-                                        .order_by(Ipblock.address)
+                                        .order_by(Ipblock.address)).scalars().all()
                 item['children'] = sort_and_label(
                     [explore(c) for c in children] +
                     [{'ip': f, 'status': 'Available'} for f in block.free_space])
@@ -863,8 +872,8 @@ class RPC(object):
                 raise InvalidStatusError('%s from layer3domain %s is not a Container' % (block, layer3domain.name))
             blocks = [block]
         else:
-            blocks = Ipblock.query.filter_by(parent_id=None, status=get_status('Container'),
-                                             layer3domain=layer3domain).all()
+            blocks = db.session.execute(select(Ipblock).filter_by(parent_id=None, status=get_status('Container'),
+                                             layer3domain=layer3domain)).scalars().all()
         containers = sort_and_label(explore(block) for block in blocks)
         if include_messages:
             return {'containers': containers,
@@ -886,7 +895,7 @@ class RPC(object):
         del attributes
 
         def get_children(block=None, version=None):
-            q = Ipblock.query.filter_by(parent_id=block.id if block else None)
+            q = select(Ipblock).filter_by(parent_id=block.id if block else None)
             if version:
                 q = q.filter_by(version=version)
             if status:
@@ -895,7 +904,7 @@ class RPC(object):
                 q = q.options(joinedload('pool'))
             if need_attributes:
                 q = q.options(joinedload('attributes'))
-            return q.order_by(Ipblock.address).all()
+            return db.session.execute(q.order_by(Ipblock.address)).scalars().all()
 
         def get_free_space(parent, children):
             # parent won't have a status if it's the fake ipblock created to explore the whole IPvX space
@@ -962,8 +971,8 @@ class RPC(object):
                 blocks = get_children(block=ipblock)
                 result = add_children(ipblock, blocks, depth)
         if id2dict:
-            ptrs = db.session.query(Ipblock.id, RR.target).filter(RR.type == 'PTR') \
-                .filter(Ipblock.id.in_(list(id2dict.keys()))).join(RR).all()
+            ptrs = db.session.execute(select(Ipblock.id, RR.target).filter(RR.type == 'PTR') \
+                .filter(Ipblock.id.in_(list(id2dict.keys()))).join(RR)).all()
             for id, target in ptrs:
                 if id in id2dict and target:
                     id2dict[id].setdefault('attributes', {})['ptr_target'] = target
@@ -978,7 +987,7 @@ class RPC(object):
         self.user.can_network_admin()
         if owner is not None:
             owner = get_group(owner)
-        if Pool.query.filter_by(name=name).count():
+        if db.session.execute(select(Pool).filter_by(name=name)).scalars().first():
             raise AlreadyExistsError("A pool named '%s' already exists" % name)
         layer3domain = _get_layer3domain_arg(layer3domain)
         pool = Pool(name=name, owner=owner, layer3domain=layer3domain)
@@ -1004,13 +1013,13 @@ class RPC(object):
     @updating
     def ippool_rename(self, old_name, new_name):
         self.user.can_network_admin()
-        if Pool.query.filter_by(name=new_name).count():
+        if db.session.execute(select(Pool).filter_by(name=new_name)).scalars().first():
             raise AlreadyExistsError("A pool named '%s' already exists" % new_name)
         get_pool(old_name).name = new_name
 
     @readonly
     def ippool_count(self, pool=None, vlan=None, cidr=None, can_allocate=None, owner=None, layer3domain=None):
-        return self._ippool_query(pool, vlan=vlan, cidr=cidr, can_allocate=can_allocate, owner=owner, layer3domain=layer3domain).count()
+        return db.session.execute(self._ippool_query(pool, vlan=vlan, cidr=cidr, can_allocate=can_allocate, owner=owner, layer3domain=layer3domain).statement).scalar()
 
     @readonly
     def ippool_list(self, pool=None, vlan=None, cidr=None, full=False, include_subnets=True,
@@ -1025,8 +1034,9 @@ class RPC(object):
             ids = ids.order_by(Pool.name).offset(offset).limit(limit)
         else:
             ids = ids.order_by(Pool.name)
-        ids = select([ids.subquery().c.id])
-        ids = select([ids.alias()])
+        ids_subquery = ids.subquery()
+        ids = select(ids_subquery.c.id)
+        ids_alias = ids.alias()
 
         custom_attr = set(attributes) - set(Pool.AttrNameClass.reserved)
         qfields = [Pool.name, Pool.created, Pool.modified, Pool.modified_by, Vlan.vid, Layer3Domain.name.label('layer3domain')]
@@ -1034,12 +1044,12 @@ class RPC(object):
             if self.user.is_super_admin:
                 qfields.append(literal(True).label('can_allocate'))
             else:
-                rights = db.session.query(func.count(AccessRight.id)).correlate(Pool)\
+                rights = select(func.count(AccessRight.id)).select_from(Pool)\
                     .filter(or_(AccessRight.access == 'network_admin',
                                 and_(AccessRight.access == 'allocate',
                                      AccessRight.object_class == 'Ippool',
                                      AccessRight.object_id == Pool.id)))\
-                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(*Group.users.attr)\
+                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(GroupMembership, Group.id == GroupMembership.group_id).outerjoin(User, GroupMembership.user_id == User.id)\
                     .filter(User.username == self.username).scalar_subquery()
                 qfields.append(and_(rights > 0).label('can_allocate'))
         if include_subnets:
@@ -1047,7 +1057,7 @@ class RPC(object):
         q = db.session.query(*qfields)
         if include_subnets:
             q = q.outerjoin(Pool.subnets)
-        q = q.outerjoin(Pool.vlan).filter(Pool.id.in_(ids))
+        q = q.outerjoin(Pool.vlan).filter(Pool.id.in_(select(ids_alias)))
         q = q.join(Pool.layer3domain)
 
         pools = {}
@@ -1095,20 +1105,21 @@ class RPC(object):
             ids = ids.order_by(Pool.name)
         if limit is not None:
             ids = ids.offset(offset).limit(limit)
-        ids = select([ids.subquery().c.id])
-        ids = select([ids.alias()])
+        ids_subquery = ids.subquery()
+        ids = select(ids_subquery.c.id)
+        ids_alias = ids.alias()
 
         qfields = [Pool.name, Vlan.vid, Pool.version]
         if fields:
             if self.user.is_super_admin:
                 qfields.append(literal(True).label('can_allocate'))
             else:
-                rights = db.session.query(func.count(AccessRight.id)).correlate(Pool) \
+                rights = select(func.count(AccessRight.id)).select_from(Pool) \
                     .filter(or_(AccessRight.access == 'network_admin',
                                 and_(AccessRight.access == 'allocate',
                                      AccessRight.object_class == 'Ippool',
                                      AccessRight.object_id == Pool.id))) \
-                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(*Group.users.attr) \
+                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(GroupMembership, Group.id == GroupMembership.group_id).outerjoin(User, GroupMembership.user_id == User.id) \
                     .filter(User.username == self.username).scalar_subquery()
                 qfields.append(and_(rights > 0).label('can_allocate'))
         if include_subnets:
@@ -1116,7 +1127,7 @@ class RPC(object):
         q = db.session.query(*qfields)
         if include_subnets:
             q = q.outerjoin(Pool.subnets)
-        q = q.outerjoin(Pool.vlan).filter(Pool.id.in_(ids))
+        q = q.outerjoin(Pool.vlan).filter(Pool.id.in_(select(ids_alias)))
 
         pools = {}
         for row in q:
@@ -1208,14 +1219,14 @@ class RPC(object):
     def ippool_get_delegations(self, name, full=False, include_usage=True):
         pool = get_pool(name)
         subnet = aliased(Ipblock)
-        delegations = Ipblock.query\
-            .join(IpblockStatus).filter_by(name='Delegation')\
+        delegations = db.session.query(Ipblock)\
+            .join(IpblockStatus, IpblockStatus.name == 'Delegation')\
             .join(subnet, Ipblock.parent_id == subnet.id)\
             .filter(subnet.ippool_id == pool.id)\
-            .order_by(Ipblock.address)
+            .order_by(Ipblock.address).all()
         result = []
         for delegation in delegations:
-            properties = {'delegation': delegation.label(expanded=full)}
+            properties = {'delegation': delegation.ip.label(expanded=full)}
             if include_usage:
                 properties['free'] = delegation.free
                 properties['total'] = delegation.total
@@ -1264,15 +1275,15 @@ class RPC(object):
                     .filter(Ipblock.layer3domain == layer3domain) \
                     .filter(Ipblock.address <= subnet.address) \
                     .filter(Ipblock.prefix < subnet.prefix) \
-                    .join(IpblockStatus).filter(IpblockStatus.name == 'Container') \
-                    .order_by(Ipblock.address.desc(), Ipblock.prefix) \
+                    .join(IpblockStatus, IpblockStatus.name == 'Container') \
+                    .order_by(desc(Ipblock.address), Ipblock.prefix) \
                     .limit(1)
             if parent.first() is None:
                 raise DimError('could not find new parent for subnet "%s" in new layer3domain' % (subnet.ip))
 
             overlaps = db.session.query(Ipblock) \
                     .filter(Ipblock.layer3domain == layer3domain) \
-                    .filter(Ipblock.address.between(subnet.address, subnet.ip.broadcast.address)) \
+                    .filter(between(Ipblock.address, subnet.address, subnet.ip.broadcast.address)) \
                     .filter(Ipblock.prefix >= subnet.prefix) \
                     .count()
             if overlaps > 0:
@@ -1282,8 +1293,8 @@ class RPC(object):
                     .filter(Ipblock.layer3domain == layer3domain) \
                     .filter(Ipblock.address <= subnet.address) \
                     .filter(Ipblock.prefix < subnet.prefix) \
-                    .join(IpblockStatus).filter(IpblockStatus.name != 'Container') \
-                    .order_by(Ipblock.address.desc(), Ipblock.prefix) \
+                    .join(IpblockStatus, IpblockStatus.name != 'Container') \
+                    .order_by(desc(Ipblock.address), Ipblock.prefix) \
                     .limit(1)
             if (overlaps is not None and overlaps.first() is not None
                     and subnet.parent is not None):
@@ -1297,7 +1308,7 @@ class RPC(object):
             Messages.info("Changing subnet %s to new parent %s in layer3domain %s" % (subnet.ip, parent.first().ip, layer3domain.name))
 
             self._create_reverse_zones(subnet)
-            children = subnet.children.all()
+            children = db.session.query(Ipblock).filter(Ipblock.parent==subnet).all()
             for child in children:
                 logging.info("Changing child %s of subnet %s to layer3domain %s" % (child.ip, subnet.ip, layer3domain.name))
                 Messages.info("Changing child %s of subnet %s to layer3domain %s" % (child.ip, subnet.ip, layer3domain.name))
@@ -1311,19 +1322,21 @@ class RPC(object):
 
                     rr = db.session.query(RR).filter(RR.ipblock_id == child.id).filter(RR.type == 'PTR').first()
                     if rr is not None:
-                        rr.delete(send_delete_rr_event = True)
+                        db.session.delete(rr)
+                        db.session.flush()
                         Messages.info("Deleting RR %s from %s" % (rr.bind_str(relative=True), rr.view))
                         make_transient(rr)
                         rr.id = None
                         rr.view = new_view
-                        rr.insert()
+                        db.session.add(rr)
+                        db.session.flush()
                         Messages.info("Creating RR {rr}{comment_msg} in {view_msg}".format(
                             rr=rr.bind_str(relative=True),
                             comment_msg=' comment {0}'.format(rr.comment),
                             view_msg=rr.view))
 
                 elif child.status.name == 'Delegation':
-                    children += child.children.all()
+                    children += db.session.query(Ipblock).filter(Ipblock.parent==child).all()
                     child.layer3domain = layer3domain
                 elif child.status.name == 'Reserved':
                     child.layer3domain = layer3domain
@@ -1391,8 +1404,9 @@ class RPC(object):
     @readonly
     def ippool_favorite(self, pool):
         '''Returns true iff pool is favorite'''
-        return FavoritePool.query.filter_by(user_id=self.user.id)\
-                           .join(Pool).filter(Pool.name == pool).count() > 0
+        statement = select(FavoritePool).filter_by(user_id=self.user.id)\
+                           .join(Pool, Pool.name == pool)
+        return db.session.execute(statement).scalars().first() is not None
 
     @updating
     def ippool_favorite_add(self, pool):
@@ -1402,7 +1416,7 @@ class RPC(object):
     @updating
     def ippool_favorite_remove(self, pool):
         pool = get_pool(pool)
-        FavoritePool.query.filter_by(user_id=self.user.id).filter_by(ippool_id=pool.id).delete()
+        db.session.execute(delete(FavoritePool).filter_by(user_id=self.user.id).filter_by(ippool_id=pool.id))
 
     @updating
     def subnet_set_priority(self, subnet, priority, layer3domain=None, **options):
@@ -1534,8 +1548,8 @@ class RPC(object):
             dim.dns.copy_ns_rrs(new_zone, view, self.user)
 
         # If user has zone_create, grant zone_admin for zone to user-group
-        zone_create_group = Group.query.filter(Group.users.any(id=self.user.id)) \
-            .filter(Group.rights.any(access='zone_create')).first()
+        zone_create_group = db.session.execute(select(Group).filter(Group.users.any(id=self.user.id)) \
+            .filter(Group.rights.any(access='zone_create'))).scalar()
         if zone_create_group:
             _group_grant_access(zone_create_group, 'zone_admin', zone_name)
         return {'messages': Messages.get()}
@@ -1568,11 +1582,11 @@ class RPC(object):
             raise InvalidParameterError('Zone rename not implemented')
         new_name = Zone.from_display_name(new_name)
         zone_name = zone
-        zone = get_zone(zone_name, profile=profile)
+        zone = db.session.execute(select(Zone).filter_by(name=zone_name, profile=profile)).scalar_one()
         dim.dns.zone_available_check(new_name, profile)
         zone.name = new_name
         for view in zone.views:
-            for rr in RR.query.filter_by(view=view):
+            for rr in db.session.execute(select(RR).filter_by(view=view)).scalars():
                 rr.name = rr.name[:-len(zone_name) - 1] + new_name + '.'
 
     @updating
@@ -1580,9 +1594,9 @@ class RPC(object):
         zone = get_zone(zone, profile=False)
         self.user.can_manage_zone(zone)
         if is_reverse_zone(zone.name):
-            if Layer3Domain.query.filter_by(name=view).count() == 0:
+            if db.session.execute(select(Layer3Domain).filter_by(name=view)).scalar():
                 raise DimError('No layer3domain named %s' % view)
-        if ZoneView.query.filter_by(zone=zone, name=view).count():
+        if db.session.execute(select(ZoneView).filter_by(zone=zone, name=view)).scalar():
             raise AlreadyExistsError('View {0} already exists for zone {1}'.format(view, zone.display_name))
         if from_profile:
             from_profile = get_zone(from_profile, profile=True)
@@ -1595,7 +1609,7 @@ class RPC(object):
     def zone_rename_view(self, zone, view, new_name):
         zone = get_zone(zone, profile=False)
         self.user.can_manage_zone(zone)
-        if ZoneView.query.filter_by(zone=zone, name=new_name).count():
+        if db.session.execute(select(ZoneView).filter_by(zone=zone, name=new_name)).scalar():
             raise AlreadyExistsError("A zone view named '%s' already exists for the zone %s" % (new_name, zone.display_name))
         view = get_view(zone, view)
         view.name = new_name
@@ -1609,7 +1623,7 @@ class RPC(object):
     @readonly
     def zone_count(self, pattern='*', profile=False, alias=False, can_create_rr=None, can_delete_rr=None):
         pattern = make_wildcard(pattern)
-        q = db.session.query(Zone.name).filter(Zone.name.like(pattern)).filter_by(profile=profile)
+        q = db.session.query(Zone.name).filter(Zone.name.like(pattern), Zone.profile==profile)
         if (can_delete_rr or can_create_rr) and not self.user.is_super_admin:
             views = self._changeable_views(can_create_rr=can_create_rr, can_delete_rr=can_delete_rr)
             q = q.filter(0 < views)
@@ -1636,20 +1650,19 @@ class RPC(object):
             else:
                 qfields.append(and_(0 < self._changeable_views(can_create_rr=True, can_delete_rr=False)).label('can_create_rr'))
                 qfields.append(and_(0 < self._changeable_views(can_create_rr=False, can_delete_rr=True)).label('can_delete_rr'))
-        zones = db.session.query(Zone.name.label('name'), *qfields).filter(Zone.name.like(pattern)).filter(Zone.profile==profile)\
+        zones = db.session.query(Zone.name.label('name'), *qfields).filter(Zone.name.like(pattern), Zone.profile==profile)\
             .order_by(Zone.name)
         if owner is not None:
             zones = zones.join(Group).filter(Zone.owner == get_group(owner))
         if exclude_reverse:
-            zones = zones.filter(Zone.name.notlike('%in-addr.arpa')).filter(Zone.name.notlike('%ip6.arpa'))
+            zones = zones.filter(Zone.name.notlike('%in-addr.arpa'), Zone.name.notlike('%ip6.arpa'))
         if (can_delete_rr or can_create_rr) and not self.user.is_super_admin:
             zones = zones.filter(0 < self._changeable_views(can_create_rr=can_create_rr, can_delete_rr=can_delete_rr))
         if fields:
             zones = zones.outerjoin(views_stmt, Zone.id == views_stmt.c.zone_id)
-        zones = zones.order_by('name')
+        zones = zones.order_by(Zone.name)
         if limit:
-            offset = int(offset)
-            zones = zones[offset:offset + int(limit)]
+            zones = zones.slice(offset, offset + int(limit))
 
         def result_dict(zone, fields):
             res = {'name': zone.name if zone.name != '' else '.'}
@@ -1682,8 +1695,8 @@ class RPC(object):
             else:
                 qfields.append(and_(0 < self._changeable_views(can_create_rr=True, can_delete_rr=False)).label('can_create_rr'))
                 qfields.append(and_(0 < self._changeable_views(can_create_rr=False, can_delete_rr=True)).label('can_delete_rr'))
-        zones = db.session.query(Zone.name.label('name'), Zone.id, Zone.keys.any().label('dnssec').label('dnssec'),
-                                 *qfields).filter(Zone.name.like(pattern)).filter(Zone.profile==profile)
+        zones = db.session.query(Zone.name.label('name'), Zone.id,
+                                 *qfields).filter(Zone.name.like(pattern), Zone.profile==profile)
         if owner is not None:
             zones = zones.join(Group).filter(Zone.owner == get_group(owner))
 
@@ -1715,13 +1728,12 @@ class RPC(object):
             zones = zones.join(ZoneView).join(FavoriteZoneView).filter(FavoriteZoneView.user_id == self.user.id).distinct()
 
         if order == 'desc':
-            zones = zones.order_by('name desc')
+            zones = zones.order_by(desc(Zone.name))
         else:
-            zones = zones.order_by('name')
+            zones = zones.order_by(Zone.name)
         count = zones.count()
         if limit:
-            offset = int(offset)
-            zones = zones[offset:offset + int(limit)]
+            zones = zones.slice(offset, offset + int(limit))
 
         by_id = collections.defaultdict(list)
         # Join views with selected zones
@@ -1732,7 +1744,7 @@ class RPC(object):
                               .filter(ZoneView.zone_id.in_(z.id for z in zones))\
                               .order_by(ZoneView.name)
             if favorite_only:
-                views = views.join(FavoriteZoneView).filter_by(user_id=self.user.id)
+                views = views.join(FavoriteZoneView).filter(FavoriteZoneView.user_id == self.user.id)
             for view in views:
                 by_id[view.zone_id].append({
                     'name': view.name,
@@ -1743,7 +1755,7 @@ class RPC(object):
         def result_dict(zone, by_id, fields):
             res = {
                 'name': zone.name if zone.name != '' else '.',
-                'dnssec': bool(zone.dnssec),
+                'dnssec': bool(db.session.query(ZoneKey).filter_by(zone_id=zone.id).first()),
                 'views': []
             }
             if fields:
@@ -1789,7 +1801,7 @@ class RPC(object):
         qfields = []
         if fields:
             qfields.extend(self._zone_view_rights())
-        views = db.session.query(ZoneView.name, *qfields).filter_by(zone=zone).group_by(ZoneView.id, ZoneView.name, *qfields).order_by(ZoneView.name)
+        views = db.session.query(ZoneView.name, *qfields).filter_by(zone=zone).order_by(ZoneView.name)
         if (can_create_rr or can_delete_rr) and not self.user.is_super_admin:
             views = self._filter_views(views, can_create_rr=can_create_rr, can_delete_rr=can_delete_rr)
 
@@ -1819,7 +1831,14 @@ class RPC(object):
     def zone_favorite_remove(self, zone, view=None):
         zone = get_zone(zone, profile=False)
         view = get_view(zone, view)
-        FavoriteZoneView.query.filter_by(user_id=self.user.id).filter_by(zoneview_id=view.id).delete()
+        db.session.execute(
+            FavoriteZoneView.__table__.delete().where(
+                and_(
+                    FavoriteZoneView.user_id == self.user.id,
+                    FavoriteZoneView.zoneview_id == view.id
+                )
+            )
+        )
 
     @readonly
     def zone_list_keys(self, zone_name):
@@ -1874,7 +1893,7 @@ class RPC(object):
         if zone.registrar_account:
             attributes['registrar-account'] = zone.registrar_account.name
         if not zone.profile:
-            attributes.update(views=db.session.query(ZoneView.id).filter_by(zone=zone).count())
+            attributes.update(views=db.session.query(ZoneView.id).filter(ZoneView.zone == zone).count())
             groups = 0
             for view in zone.views:
                 groups += len(view.groups)
@@ -2017,7 +2036,7 @@ class RPC(object):
     def zone_delete_key(self, zone_name, key_label):
         zone = get_zone(zone_name, profile=False)
         self.user.can_manage_zone(zone)
-        key = ZoneKey.query.filter(ZoneKey.zone_id == zone.id).filter(ZoneKey.label == key_label).first()
+        key = db.session.execute(select(ZoneKey).filter(ZoneKey.zone_id == zone.id, ZoneKey.label == key_label)).scalar_one_or_none()
         if key is None:
             raise DimError('Key %s does not exist for zone %s' % (key_label, zone_name))
         self._zone_delete_key(key)
@@ -2295,7 +2314,7 @@ class RPC(object):
         rr_query = db.session.query(*qfields)\
             .join(RR.view).join(ZoneView.zone).filter(Zone.profile == profile)\
             .outerjoin(RR.ipblock).outerjoin(Ipblock.layer3domain)
-        soa_query = ZoneView.query.join(ZoneView.zone).options(contains_eager(ZoneView.zone)).filter(Zone.profile == profile)
+        soa_query = db.session.query(ZoneView).options(joinedload(ZoneView.zone)).filter(ZoneView.zone.has(profile=profile))
         if zone:
             zone = get_zone(zone, profile)
             view = get_view(zone, view)
@@ -2334,31 +2353,32 @@ class RPC(object):
             columns = [RR.name, RR.target]
             rr_query = rr_query.filter(or_(*[col.like(wildcard) for col in columns]))
             if soa_query is not None:
-                soa_query = soa_query.filter(or_((Zone.name + '.').like(wildcard),
+                soa_query = soa_query.filter(or_(Zone.name.like(wildcard),
                                                  ZoneView.primary.like(wildcard)))
         # We can't limit reverse zones records because we can't do the same sorting in the query
         if limit is not None and not reverse_zone_sorting:
             limit = int(limit)
             rr_query = rr_query.order_by(Zone.name,
                                          trim_trailing(Zone.name + '.', RR.name),
-                                         ZoneView.name).limit(limit + offset)
+                                         ZoneView.name).limit(limit).offset(offset)
             if soa_query is not None:
-                soa_query = soa_query.order_by(Zone.name, ZoneView.name).limit(limit + offset)
+                soa_query = soa_query.order_by(Zone.name, ZoneView.name).limit(limit).offset(offset)
 
         rrs = []
-        for rr in rr_query.all():
-            v = dict(record=RR.record_name(rr.name, rr.zone),
-                     zone=Zone.to_display_name(rr.zone),
+        result = rr_query.all()
+        for rr in result:
+            v = dict(record=RR.record_name(rr.name, rr.zone.name),
+                     zone=Zone.to_display_name(rr.zone.name),
                      name=rr.name,
-                     view=rr.view,
+                     view=rr.view.name,
                      ttl=rr.ttl,
                      type=rr.type,
                      value=rr.value)
             if rr.layer3domain:
-                v['layer3domain'] = rr.layer3domain
+                v['layer3domain'] = rr.layer3domain.name
             if fields:
-                can_create_rr = rr.can_create_rr
-                can_delete_rr = rr.can_delete_rr
+                can_create_rr = self.user.can_create_rr(rr.view, rr.type)
+                can_delete_rr = self.user.can_delete_rr(rr.view, rr.type)
                 if rr.type == 'PTR' and is_reverse_zone(v['zone']):
                     can_create_rr = can_delete_rr = True
                 v.update(dict(can_create_rr=can_create_rr,
@@ -2439,7 +2459,7 @@ class RPC(object):
         rr_query = db.session.query(*qfields) \
             .join(RR.view).join(ZoneView.zone).filter(Zone.profile == profile) \
             .outerjoin(RR.ipblock).outerjoin(Ipblock.layer3domain)
-        soa_query = ZoneView.query.join(ZoneView.zone).options(contains_eager(ZoneView.zone)).filter(Zone.profile == profile)
+        soa_query = db.session.query(ZoneView).join(ZoneView.zone).options(contains_eager(ZoneView.zone)).filter(Zone.profile == profile)
         if zone:
             zone = get_zone(zone, profile)
             view = get_view(zone, view)
@@ -2481,10 +2501,10 @@ class RPC(object):
                 soa_query = soa_query.filter(or_((Zone.name + '.').like(wildcard),
                                                  ZoneView.primary.like(wildcard)))
 
-        rr_count = fast_count(rr_query)
+        rr_count = db.session.execute(select(func.count())).scalar()
         soa_count = 0
         if soa_query:
-            soa_count = fast_count(soa_query)
+            soa_count = db.session.execute(select(func.count())).scalar()
         count = rr_count + soa_count
 
         order_columns = {
@@ -2536,7 +2556,7 @@ class RPC(object):
                 return dict([(attr, getattr(view, attr)) for attr in attrs])
             return view.soa_value()
         if soa_query is not None:
-            for view in soa_query.all():
+            for view in db.session.execute(soa_query).scalars():
                 rr = dict(record='@',
                           zone=view.zone.display_name,
                           name=view.zone.name + '.',
@@ -2550,7 +2570,8 @@ class RPC(object):
                 rrs.append(rr)
 
         if rr_query is not None:
-            for rr in rr_query.all():
+            for rr_row in db.session.execute(rr_query).all():
+                rr = rr_row[0]
                 v = dict(record=RR.record_name(rr.name, rr.zone),
                          zone=Zone.to_display_name(rr.zone),
                          name=rr.name,
@@ -2616,7 +2637,7 @@ class RPC(object):
         Return an oriented graph of references to the rr **kwargs.
         The graph is specified by a set of rr nodes and a map (node, children).
         '''
-        root, zone = self._get_rr_and_zone(view=view, **kwargs)
+        rr, zone = self._get_rr_and_zone(view=view, **kwargs)
 
         def rr_object(rr):
             return dict(name=rr.name,
@@ -2627,7 +2648,7 @@ class RPC(object):
                         value=rr.value)
         records = {}
         graph = {}
-        nodes = [root]
+        nodes = [rr]
         while len(nodes):
             rr = nodes.pop()
             if rr in records:
@@ -2636,16 +2657,16 @@ class RPC(object):
             graph[rr.id] = []
             IP_RELATED = ['PTR', 'A', 'AAAA']
             for ref in orphaned_references(rr):
-                if not (ref.type == root.type and root.type in IP_RELATED) and\
-                        not (not delete and ref.type not in IP_RELATED and rr.type not in IP_RELATED and root.type in IP_RELATED):
+                if not (ref.type == rr.type and rr.type in IP_RELATED) and\
+                        not (not delete and ref.type not in IP_RELATED and rr.type not in IP_RELATED and rr.type in IP_RELATED):
                     nodes.append(ref)
                     graph[rr.id].append(ref.id)
-        return {'records': sorted([rr_object(records[r]) for r in records], key=lambda x: x['id']), 'graph': graph, 'root': root.id}
+        return {'records': sorted([rr_object(records[r]) for r in records], key=lambda x: x['id']), 'graph': graph, 'root': rr.id}
 
     @updating
     def rr_edit(self, id, views=None, references=None, **kwargs):
         id = int(id)
-        rr = RR.query.filter(RR.id == id).first()
+        rr = db.session.execute(select(RR).filter(RR.id == id)).scalar_one_or_none()
         if rr is None:
             raise InvalidParameterError('Invalid rr id %d.' % id)
         rr_fields = RR.get_class(rr.type).fields
@@ -2681,7 +2702,7 @@ class RPC(object):
     @updating
     def zone_group_create(self, group, comment=None):
         self.user.can_dns_admin()
-        if ZoneGroup.query.filter_by(name=group).count():
+        if db.session.execute(select(ZoneGroup).filter_by(name=group)).scalar_one_or_none():
             raise AlreadyExistsError("A zone-group named '%s' already exists" % group)
         db.session.add(ZoneGroup(name=group, comment=comment))
 
@@ -2706,7 +2727,7 @@ class RPC(object):
         zone = get_zone(zone, False)
         self.user.can_manage_zone(zone)
         group = get_zone_group(group)
-        view_already = ZoneView.query.join(ZoneGroup.views).filter(ZoneGroup.id == group.id).filter(ZoneView.zone_id == zone.id).first()
+        view_already = db.session.execute(select(ZoneView).join(ZoneGroup.views).filter(ZoneGroup.id == group.id).filter(ZoneView.zone_id == zone.id)).scalar_one_or_none()
         if view_already is not None:
             raise InvalidParameterError('%s view %s already in zone-group %s' % (zone.display_name, view_already.name, group.name))
         view = get_view(zone, view)
@@ -2718,7 +2739,7 @@ class RPC(object):
         self.user.can_manage_zone(zone)
         group = get_zone_group(group)
         _check_no_ongoing_actions(zone)
-        view = ZoneView.query.join(ZoneGroup.views).filter(ZoneGroup.id == group.id).filter(ZoneView.zone_id == zone.id).first()
+        view = db.session.execute(select(ZoneView).join(ZoneGroup.views).filter(ZoneGroup.id == group.id).filter(ZoneView.zone_id == zone.id)).scalar_one_or_none()
         if view is not None:
             group.views.remove(view)
             group.update_modified()
@@ -2750,7 +2771,7 @@ class RPC(object):
 
     @readonly
     def zone_group_list(self):
-        return [dict(name=name, comment=comment) for name, comment in db.session.query(ZoneGroup.name, ZoneGroup.comment).all()]
+        return [dict(name=name, comment=comment) for name, comment in db.session.execute(select(ZoneGroup.name, ZoneGroup.comment)).all()]
 
     @readonly
     def zone_group_list_outputs(self, group):
@@ -2761,11 +2782,11 @@ class RPC(object):
     def output_list(self, include_status=False):
         result = []
         if include_status:
-            outputs = db.session.query(Output, func.count(OutputUpdate.id).label('pending_records'))\
-                .outerjoin(Output.updates).group_by(*Output.__table__.columns)
+            outputs = db.session.execute(select(Output, func.count(OutputUpdate.id).label('pending_records'))\
+                .outerjoin(Output.updates).group_by(*Output.__table__.columns))
         else:
-            outputs = db.session.query(Output, literal('0'))
-        outputs = outputs.order_by(Output.name)
+            outputs = db.session.execute(select(Output, literal('0')))
+        outputs = outputs.scalars().order_by(Output.name)
         for output, pending_records in outputs:
             attrs = {'name': output.name,
                      'plugin': output.plugin}
@@ -2779,7 +2800,7 @@ class RPC(object):
     @updating
     def output_create(self, name, plugin, **options):
         self.user.can_dns_admin()
-        if Output.query.filter_by(name=name).count():
+        if db.session.execute(select(Output).filter_by(name=name)).scalar_one_or_none():
             raise AlreadyExistsError("An output named '%s' already exists" % name)
         if plugin not in Output.PLUGINS:
             raise InvalidParameterError('Plugin must be one of: %s' % ' '.join(list(Output.PLUGINS.keys())))
@@ -2839,7 +2860,7 @@ class RPC(object):
         if output.last_run.year > 1970:
             attributes['last_run'] = output.last_run
             attributes['status'] = output.status
-            attributes['pending_records'] = db.session.query(func.count(OutputUpdate.id)).filter(OutputUpdate.output == output).scalar()
+            attributes['pending_records'] = db.session.execute(select(func.count(OutputUpdate.id)).filter(OutputUpdate.output == output)).scalar_one()
         return attributes
 
     @readonly
@@ -2862,7 +2883,7 @@ class RPC(object):
 
     @readonly
     def output_update_list(self, output=None):
-        query = db.session.query(
+        query = db.session.execute(select(
             OutputUpdate.id,
             Output.name.label('output'),
             OutputUpdate.action,
@@ -2871,7 +2892,7 @@ class RPC(object):
             OutputUpdate.name,
             OutputUpdate.ttl,
             OutputUpdate.type,
-            OutputUpdate.content).join(Output).order_by(OutputUpdate.id)
+            OutputUpdate.content).join(Output).order_by(OutputUpdate.id))
         if output:
             query = query.filter(Output.name == output)
         return [dict(list(zip(list(row.keys()), row))) for row in query]
@@ -2880,42 +2901,42 @@ class RPC(object):
     def output_update_delete(self, update_ids):
         self.user.can_dns_update_agent()
         if update_ids:
-            OutputUpdate.query.filter(OutputUpdate.id.in_(update_ids)).delete(synchronize_session=False)
+            db.session.execute(delete(OutputUpdate).filter(OutputUpdate.id.in_(update_ids)))
 
     @readonly
     def history_zones(self, profile, limit=None, begin=None, end=None):
         hs = HistorySelect()
         hs.add_select(Zone, 'zone-profile' if profile else None) \
-            .where(hs.c.profile == profile).where(or_(hs.c.action == 'created',
-                                                      hs.c.action == 'deleted',
-                                                      hs.c.action == 'renamed'))
+            .where(HistorySelect.c.profile == profile).where(or_(HistorySelect.c.action == 'created',
+                                                      HistorySelect.c.action == 'deleted',
+                                                      HistorySelect.c.action == 'renamed'))
         return hs.execute(limit, begin, end)
 
     @readonly
     def history_zone(self, zone, profile, limit=None, begin=None, end=None):
         hs = HistorySelect()
-        hs.add_select(Zone, 'zone-profile' if profile else None).where(hs.c.name == zone).where(hs.c.profile == profile)
-        hs.add_select(RR).where(hs.c.zone == zone)
-        hs.add_select(ZoneView).where(hs.c.zone == zone)
-        hs.add_select(RegistrarAccount).where(hs.c.zone == zone)
-        hs.add_select(ZoneKey).where(hs.c.zone == zone)
+        hs.add_select(Zone, 'zone-profile' if profile else None).where(HistorySelect.c.name == zone).where(HistorySelect.c.profile == profile)
+        hs.add_select(RR).where(HistorySelect.c.zone == zone)
+        hs.add_select(ZoneView).where(HistorySelect.c.zone == zone)
+        hs.add_select(RegistrarAccount).where(HistorySelect.c.zone == zone)
+        hs.add_select(ZoneKey).where(HistorySelect.c.zone == zone)
         if not profile:
-            hs.add_select(ZoneGroup).where(hs.c.zone == zone)
-        hs.add_select(GroupRight).where(or_(hs.c.object == zone,
-                                            hs.c.object.like('zone ' + zone + ' %')))
+            hs.add_select(ZoneGroup).where(HistorySelect.c.zone == zone)
+        hs.add_select(GroupRight).where(or_(HistorySelect.c.object == zone,
+                                            HistorySelect.c.object.like('zone ' + zone + ' %')))
         return hs.execute(limit, begin, end, incl=([] if profile else ['view', 'layer3domain']))
 
     @readonly
     def history_zone_views(self, zone, limit=None, begin=None, end=None):
         hs = HistorySelect()
-        hs.add_select(ZoneView).where(hs.c.zone == zone)
+        hs.add_select(ZoneView).where(HistorySelect.c.zone == zone)
         return hs.execute(limit, begin, end)
 
     @readonly
     def history_zone_view(self, zone, view, limit=None, begin=None, end=None):
         hs = HistorySelect()
-        hs.add_select(ZoneView).where(hs.c.zone == zone).where(hs.c.name == view)
-        hs.add_select(RR).where(hs.c.zone == zone).where(hs.c.view == view)
+        hs.add_select(ZoneView).where(HistorySelect.c.zone == zone).where(HistorySelect.c.name == view)
+        hs.add_select(RR).where(HistorySelect.c.zone == zone).where(HistorySelect.c.view == view)
         return hs.execute(limit, begin, end, incl=['layer3domain'])
 
     @readonly
@@ -2923,7 +2944,7 @@ class RPC(object):
         hs = HistorySelect()
         query = hs.add_select(RR)
         if name is not None:
-            query.where(hs.c.name == name)
+            query.where(HistorySelect.c.name == name)
         return hs.execute(limit, begin, end, incl=['zone', 'view', 'layer3domain'])
 
     @readonly
@@ -2931,7 +2952,7 @@ class RPC(object):
         hs = HistorySelect()
         query = hs.add_select(ZoneGroup)
         if zone_group is not None:
-            query.where(hs.c.name == zone_group)
+            query.where(HistorySelect.c.name == zone_group)
         return hs.execute(limit, begin, end)
 
     @readonly
@@ -2939,7 +2960,7 @@ class RPC(object):
         hs = HistorySelect()
         query = hs.add_select(Output)
         if output is not None:
-            query.where(hs.c.name == output)
+            query.where(HistorySelect.c.name == output)
         return hs.execute(limit, begin, end)
 
     @readonly
@@ -2947,16 +2968,16 @@ class RPC(object):
         hs = HistorySelect()
         query = hs.add_select(Group)
         if group is not None:
-            query.where(hs.c.name == group)
+            query.where(HistorySelect.c.name == group)
         query = hs.add_select(GroupRight)
         if group is not None:
-            query.where(hs.c.group == group)
+            query.where(HistorySelect.c.group == group)
         return hs.execute(limit=limit, begin=begin, end=end)
 
     @readonly
     def history_ippool(self, name, limit=None, begin=None, end=None):
         hs = HistorySelect()
-        hs.add_select(Pool).where(hs.c.name == name)
+        hs.add_select(Pool).where(HistorySelect.c.name == name)
         return hs.execute(limit, begin, end, incl=['layer3domain'])
 
     @readonly
@@ -2964,18 +2985,18 @@ class RPC(object):
         ip = parse_ip(ipblock)
         hs = HistorySelect()
         query = hs.add_select(Ipblock)
-        query = query.where(hs.c.address == ip.address) \
-            .where(hs.c.prefix == ip.prefix) \
-            .where(hs.c.version == ip.version)
+        query = query.where(HistorySelect.c.address == ip.address) \
+            .where(HistorySelect.c.prefix == ip.prefix) \
+            .where(HistorySelect.c.version == ip.version)
         if layer3domain is not None and layer3domain != 'all':
             layer3domain = _get_layer3domain_arg(layer3domain)
-            query.where(hs.c.layer3domain == layer3domain.name)
+            query.where(HistorySelect.c.layer3domain == layer3domain.name)
         return hs.execute(limit, begin, end, incl=['layer3domain'])
 
     @readonly
     def history_registrar_account(self, name, limit=None, begin=None, end=None):
         hs = HistorySelect()
-        hs.add_select(RegistrarAccount).where(hs.c.name == name)
+        hs.add_select(RegistrarAccount).where(HistorySelect.c.name == name)
         return hs.execute(limit, begin, end)
 
     @readonly
@@ -2983,18 +3004,18 @@ class RPC(object):
         hs = HistorySelect()
         query = hs.add_select(Layer3Domain)
         if name is not None and name != 'all':
-            query.where(hs.c.name == name)
+            query.where(HistorySelect.c.name == name)
         return hs.execute(limit, begin, end)
 
     @readonly
     def history(self, user, limit=None, begin=None, end=None):
         def filter_by_user(query):
             if user is not None:
-                query.where(hs.c.user == user)
+                query.where(HistorySelect.c.user == user)
 
         hs = HistorySelect()
-        filter_by_user(hs.add_select(Zone).where(hs.c.profile == False))  # noqa
-        filter_by_user(hs.add_select(Zone, 'zone-profile').where(hs.c.profile == True))  # noqa
+        filter_by_user(hs.add_select(Zone).where(HistorySelect.c.profile == False))  # noqa
+        filter_by_user(hs.add_select(Zone, 'zone-profile').where(HistorySelect.c.profile == True))  # noqa
         for klass in [Pool, Ipblock, ZoneView, RR, ZoneGroup, Output, Group, GroupRight, RegistrarAccount, ZoneKey]:
             filter_by_user(hs.add_select(klass))
         return hs.execute(limit, begin, end, incl=['zone', 'view', 'layer3domain'])
@@ -3099,9 +3120,9 @@ class RPC(object):
     def _create_reverse_zones(self, block):
         profile = dim.dns.reverse_zone_profile(block.ip, block.layer3domain)
         for name in subnet_reverse_zones(block):
-            zone = Zone.query.filter_by(name=name).first()
+            zone = db.session.execute(select(Zone).filter_by(name=name)).scalar_one_or_none()
             if zone:
-                if ZoneView.query.filter_by(zone=zone, name=block.layer3domain.name).count() == 0:
+                if db.session.execute(select(ZoneView).filter_by(zone=zone, name=block.layer3domain.name)).scalar_one_or_none() is None:
                     self.zone_create_view(zone.name, view=block.layer3domain.name, from_profile=profile)
                     Messages.info('Creating view %s in zone %s %s' % (
                         block.layer3domain.name, zone.name,
@@ -3113,22 +3134,21 @@ class RPC(object):
         if block.version == 4 and block.prefix > 24:
             # Check that the subnet is the last for the reverse zone
             rev_ip = IP(int(block.address) & ~255, prefix=24, version=4)
-            q = (db.session.query(Ipblock.id)
-                 .join(IpblockStatus).filter(IpblockStatus.name == 'Subnet')
+            q = (db.session.execute(select(Ipblock.id)
+                 .join(IpblockStatus, Ipblock.status_id == IpblockStatus.id).filter(IpblockStatus.name == 'Subnet')
                  .filter(Ipblock.version == 4)
                  .filter(Ipblock.layer3domain_id == block.layer3domain_id)
-                 .filter(Ipblock.prefix < 32)
-                 .filter(inside(Ipblock.address, rev_ip)))
-            if q.count() > 0:
+                 .filter(inside(Ipblock.address, rev_ip))).scalars().all())
+            if len(q) > 0:
                 return
         for name in subnet_reverse_zones(block):
-            if Zone.query.filter_by(name=name).count():
+            if db.session.execute(select(Zone).filter_by(name=name)).scalar_one_or_none():
                 zone = get_zone(name, profile=False)
-                view = ZoneView.query.filter_by(zone=zone, name=block.layer3domain.name).first()
+                view = db.session.execute(select(ZoneView).filter_by(zone=zone, name=block.layer3domain.name)).scalar_one_or_none()
                 if view is None:
                     continue
                 # Delete all @ NS
-                ns_rrs = RR.query.filter_by(type='NS', view=view, name=name + '.')
+                ns_rrs = db.session.execute(select(RR).filter_by(type='NS', view=view, name=name + '.')).scalars().all()
                 delete_with_references(ns_rrs, free_ips=False, references='ignore', user=self.user)
                 # If force, ignore failure to delete the zone
                 deleted = True
@@ -3170,12 +3190,12 @@ class RPC(object):
         zone = get_zone(zone, profile=False)
         self.user.can_manage_zone(zone)
         view = get_view(zone, view)
-        if ZoneView.query.filter_by(zone=zone).count() == 1:
+        if db.session.execute(select(ZoneView).filter_by(zone=zone)).scalars().count() == 1:
             raise DimError('The zone %s has only one view.' % zone.name)
         return view
 
     def _zone_delete_view(self, view, cleanup, also_deleting_zone):
-        view_query = RR.query.filter_by(view=view).order_by(RR.name)
+        view_query = db.session.execute(select(RR).filter_by(view=view).order_by(RR.name)).scalars()
         view_rrs = view_query.all()
         if cleanup:
             delete_with_references(view_query, free_ips=True, references='warn', user=self.user)
@@ -3213,10 +3233,10 @@ class RPC(object):
         Failure to call this at deleting such objects will result in zombie rights which will deny
         legal operations in some cases.
         '''
-        ars = AccessRight.query.filter_by(object_class=object_class, object_id=object_id).all()
+        ars = db.session.execute(select(AccessRight).filter_by(object_class=object_class, object_id=object_id)).scalars().all()
         if ars:
             ids = [ar.id for ar in ars]
-            for gr in GroupRight.query.filter(GroupRight.accessright_id.in_(ids)):
+            for gr in db.session.execute(select(GroupRight).filter(GroupRight.accessright_id.in_(ids))).scalars():
                 db.session.delete(gr)
             for ar in ars:
                 db.session.delete(ar)
@@ -3257,7 +3277,7 @@ class RPC(object):
                 reverse_zone = get_rr_zone(reverse_name, None, profile)
             if reverse_zone:
                 view_name = kwargs['ip'].layer3domain.name
-                view_exists = ZoneView.query.filter_by(zone=reverse_zone, name=view_name).count()
+                view_exists = db.session.execute(select(ZoneView).filter_by(zone=reverse_zone, name=view_name)).scalars().count()
                 forward = make_fqdn(forward_name, forward_zone)
                 print((view_name, view_exists, zone))
                 if view_exists:
@@ -3386,22 +3406,23 @@ class RPC(object):
             zone = get_rr_zone(name, None, None)
             if zone is None:
                 raise DimError('Zone for %s not found' % name)
-            rrs = RR.query.filter_by(name=name)
+            stmt = select(RR).filter_by(name=name)
             if view is not None:
-                rrs = rrs.filter_by(view=get_view(zone, view))
+                stmt = stmt.filter_by(view=get_view(zone, view))
             else:
                 if len(zone.views) > 1:
                     raise MultipleViewsError('A view must be selected from: ' + ' '.join(sorted([v.name for v in zone.views])))
             if type is not None:
-                rrs = rrs.filter_by(type=type)
+                stmt = stmt.filter_by(type=type)
                 if kwargs:
                     kwargs = RR.validate_args(type, **kwargs)
                     value = RR.get_class(type).value_from_fields(**kwargs)
-                    rrs = rrs.filter_by(value=value)
-            if rrs.count() > 1:
+                    stmt = stmt.filter_by(value=value)
+            rrs = db.session.execute(stmt).scalars().all()
+            if len(rrs) > 1:
                 raise DimError('%s is ambiguous' % name)
-            elif rrs.count() == 1:
-                return (rrs.one(), zone)
+            elif len(rrs) == 1:
+                return (rrs[0], zone)
             raise DimError('No records found.')
 
         if 'type' in kwargs:
@@ -3416,7 +3437,7 @@ class RPC(object):
             unknown = set(kwargs.keys()) - set(['name'])
             if unknown:
                 raise InvalidParameterError('Unknown parameters: %s' % ' '.join(unknown))
-        return _get_rr_helper(view=view, **kwargs)
+        return _get_rr_helper(name=kwargs['name'], view=view, type=kwargs.get('type'), **kwargs)
 
     def _rr_create(self, zone=None, views=None, ttl=None, comment=None, profile=False, allow_overlap=False, **kwargs):
         self._check_rr_parameters(kwargs, creating=True)
@@ -3441,7 +3462,7 @@ class RPC(object):
         if references and kwargs:
             # Validate references parameter
             references = [int(i) for i in references]
-            rrs = RR.query.filter(RR.id.in_(references)).all()
+            rrs = db.session.query(RR).filter(RR.id.in_(references)).all()
             if len(rrs) != len(references):
                 missing_refs = set(references) - set([r.id for r in rrs])
                 raise InvalidParameterError('Invalid references ids: ' + ', '.join(missing_refs))
@@ -3491,7 +3512,7 @@ class RPC(object):
         # Delete all A/AAAA records with name changed
         for (rr, _) in a_name_changes:
             logging.debug('Deleting A/AAAA rr with changed name %s' % rr)
-            delete_with_references(RR.query.filter(RR.id == rr.id), free_ips=False, references='warn', user=user)
+            delete_with_references(db.session.query(RR).filter(RR.id == rr.id), free_ips=False, references='warn', user=user)
         # Create A/AAAA record with name changed
         # Only creating once, since we pass all the views
         for (rr, changes) in a_name_changes:
@@ -3525,7 +3546,7 @@ class RPC(object):
                         and_(AccessRight.access == 'allocate',
                              AccessRight.object_class == 'Ippool',
                              AccessRight.object_id == Pool.id)))\
-                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(*Group.users.attr)\
+                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(Group.users)\
                     .filter(User.username == self.username).distinct()
         if pool is not None:
             q = q.filter(Pool.name.like(make_wildcard(pool)))
@@ -3548,7 +3569,7 @@ class RPC(object):
     def _filter_views(self, query, can_create_rr, can_delete_rr):
         access = self._view_access_expr(can_create_rr=can_create_rr, can_delete_rr=can_delete_rr)
         return query.join(AccessRight, or_(*access))\
-                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(*Group.users.attr)\
+                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(Group.users)\
                     .filter(User.username == self.username)
 
     def _view_access_expr(self, can_create_rr, can_delete_rr):
@@ -3571,7 +3592,7 @@ class RPC(object):
             def has_access(can_create_rr, can_delete_rr):
                 access = self._view_access_expr(can_create_rr=can_create_rr, can_delete_rr=can_delete_rr)
                 return db.session.query(func.count(AccessRight.id)).correlate(ZoneView).filter(or_(*access))\
-                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(*Group.users.attr)\
+                    .outerjoin(GroupRight).outerjoin(Group).outerjoin(Group.users)\
                     .filter(User.username == self.username).scalar_subquery()
             return [and_(0 < has_access(True, False)).label('can_create_rr'),
                     and_(0 < has_access(False, True)).label('can_delete_rr')]
@@ -3580,7 +3601,7 @@ class RPC(object):
     @readonly
     def ipblock_get_attrs_multi(self, ipblock, layer3domain=None, full=False, filters = {}, **options):
         ip = parse_ip(ipblock)
-        ipblocks = Ipblock.query_ip(ip, layer3domain, **filters)
+        ipblocks = db.session.query(Ipblock).filter(Ipblock.address==ip.address, Ipblock.prefix==ip.prefix, Ipblock.version==ip.version, Ipblock.layer3domain==layer3domain)
         result = []
         for ipblock in ipblocks.all():
             result.append(self.ipblock_get_attrs(ipblock, layer3domain=ipblock.layer3domain.name, full=full, **options))
@@ -3642,9 +3663,10 @@ def check_options(options):
     if options:
         raise InvalidParameterError("Unknown options: " + ' '.join(list(options.keys())))
 
+from sqlalchemy import select
 
 def get_pool(pool_name):
-    pool = Pool.query.filter_by(name=pool_name).first()
+    pool = db.session.execute(select(Pool).filter_by(name=pool_name)).scalar_one_or_none()
     if pool:
         return pool
     else:
@@ -3652,7 +3674,7 @@ def get_pool(pool_name):
 
 
 def get_status(status_name):
-    status = IpblockStatus.query.filter_by(name=status_name).first()
+    status = db.session.execute(select(IpblockStatus).filter_by(name=status_name)).scalar_one_or_none()
     if status:
         return status
     else:
@@ -3661,7 +3683,7 @@ def get_status(status_name):
 
 def get_block(block_str, layer3domain):
     ip = parse_ip(block_str)
-    block = Ipblock.query_ip(ip, layer3domain).first()
+    block = db.session.execute(select(Ipblock).filter(Ipblock.address == ip.address, Ipblock.prefix == ip.prefix, Ipblock.version == ip.version, Ipblock.layer3domain == layer3domain)).scalar_one_or_none()
     if block is None:
         raise InvalidIPError("IP block '%s' does not exist in layer3domain %s" % (block_str, layer3domain.name))
     return block
@@ -3681,7 +3703,7 @@ def get_object_id_class(access, object_name):
         return (zone.id, 'Zone')
     elif access in ['create_rr', 'delete_rr']:
         zone, view_name = object_name
-        view_id = db.session.query(ZoneView.id).filter_by(zone=zone, name=view_name).scalar()
+        view_id = db.session.execute(select(ZoneView.id).filter_by(zone=zone, name=view_name)).scalar_one_or_none()
         if view_id is None:
             raise InvalidParameterError("View '%s' does not exist in zone %s" % (view_name, zone.display_name))
         else:
@@ -3694,21 +3716,21 @@ def get_object_id_class(access, object_name):
 
 
 def get_group(group_str):
-    group = Group.query.filter_by(name=group_str).first()
+    group = db.session.execute(select(Group).filter_by(name=group_str)).scalar_one_or_none()
     if group is None:
         raise InvalidGroupError("Group '%s' does not exist" % group_str)
     return group
 
 
 def get_user(user_str: str) -> User:
-    user = User.query.filter_by(username=user_str).first()
+    user = db.session.execute(select(User).filter_by(username=user_str)).scalar_one_or_none()
     if user is None:
         raise InvalidUserError("User '%s' does not exist" % user_str)
     return user
 
 
 def get_layer3domain(name):
-    layer3domain = Layer3Domain.query.filter_by(name=name).first()
+    layer3domain = db.session.execute(select(Layer3Domain).filter_by(name=name)).scalar_one_or_none()
     if layer3domain is None:
         raise InvalidUserError("Layer3domain '%s' does not exist" % name)
     return layer3domain
@@ -3742,7 +3764,7 @@ def validate_vlan(vid):
 def make_vlan(vid):
     vid = validate_vlan(vid)
     logging.debug('make_vlan(%r)' % vid)
-    vlan = Vlan.query.filter_by(vid=vid).first()
+    vlan = db.session.execute(select(Vlan).filter_by(vid=vid)).scalar_one_or_none()
     if not vlan:
         vlan = Vlan(vid=vid)
         db.session.add(vlan)
@@ -3786,14 +3808,14 @@ def _ipblock_create(address, prefix, version, layer3domain, allow_overlap=False,
     ip = IP(int(address), prefix, version)
     if Layer3Domain.query.count() != 1:
         # Check overlap with other layer3domains (no containers)
-        q = Ipblock.query.filter(Ipblock.version == version, Ipblock.layer3domain != layer3domain).join(
+        q = select(Ipblock).filter(Ipblock.version == version, Ipblock.layer3domain != layer3domain).join(
             IpblockStatus).filter(IpblockStatus.name != 'Container')
         cond = Ipblock._ancestors_noparent_condition(ip, True)
         if not ip.is_host:
             cond = or_(cond,
                        and_(Ipblock.address >= address,
                             Ipblock.address < address + 2 ** (ip.bits - prefix)))
-        other = q.filter(cond).order_by(Ipblock.prefix.asc()).first()
+        other = db.session.execute(q.order_by(Ipblock.prefix.asc())).scalar_one_or_none()
         if other:
             overlap = ip if ip in other.ip else other.ip
             whitelisted = False
@@ -3816,7 +3838,7 @@ def _ipblock_create(address, prefix, version, layer3domain, allow_overlap=False,
 
 
 def reserve(ip, layer3domain):
-    block = Ipblock.query_ip(ip, layer3domain).first()
+    block = db.session.execute(select(Ipblock).filter(Ipblock.address == ip.address, Ipblock.prefix == ip.prefix, Ipblock.version == ip.version, Ipblock.layer3domain == layer3domain)).scalar_one_or_none()
     if block:
         if block.status.name == 'Reserved':
             pass
@@ -3845,7 +3867,7 @@ def validate_soa_attrs(attrs):
 
 
 def free_if_reserved(ip, layer3domain):
-    block = Ipblock.query_ip(ip, layer3domain).first()
+    block = db.session.execute(select(Ipblock).filter(Ipblock.address == ip.address, Ipblock.prefix == ip.prefix, Ipblock.version == ip.version, Ipblock.layer3domain == layer3domain)).scalar_one_or_none()
     if block and block.status.name == 'Reserved':
         db.session.delete(block)
 
@@ -4146,7 +4168,7 @@ def _update_registrar_keys(zone):
 def _get_layer3domain_arg(layer3domain, options=None, guess_function=None):
     if layer3domain is None:
         try:
-            return Layer3Domain.query.one()
+            return db.session.execute(Layer3Domain.query.statement).scalar_one()
         except:
             if options and options.get('pool'):
                 pool = get_pool(options['pool'])
@@ -4164,7 +4186,7 @@ def _get_layer3domain_arg(layer3domain, options=None, guess_function=None):
 def _find_ip(ip):
     if type(ip) != IP:
         ip = parse_ip(ip)
-    blocks = Ipblock.query_ip(ip, None).all()
+    blocks = db.session.execute(Ipblock.query_ip(ip, None).statement).scalars().all()
     if len(blocks) == 1:
         return blocks[0].layer3domain
 
@@ -4181,7 +4203,7 @@ def _find_ipblock(ipblock, layer3domain, status=None):
     if not valid_block(ipblock):
         Messages.warn('%s rounded to %s because it is not a valid CIDR block'
                       % (ipblock, ip))
-    block = Ipblock.query_ip(ip, layer3domain).first()
+    block = db.session.execute(Ipblock.query_ip(ip, layer3domain).statement).scalar_one_or_none()
     if block:
         return block
     status_str = ' or '.join(status)
@@ -4190,7 +4212,7 @@ def _find_ipblock(ipblock, layer3domain, status=None):
         parents = Ipblock._ancestors_noparent_query(ip, layer3domain)
         if status:
             parents = parents.join(IpblockStatus).filter(IpblockStatus.name.in_(status))
-        parents = parents.all()
+        parents = db.session.execute(parents.statement).scalars().all()
         if parents:
             Messages.warn('%s rounded to %s because no ipblock exists at %s with status %s'
                         % (ip, parents[0].ip, ip, status_str))
@@ -4201,7 +4223,7 @@ def _find_ipblock(ipblock, layer3domain, status=None):
                                        Ipblock.layer3domain_id == layer3domain.id)
     if status:
         descendants = descendants.join(IpblockStatus).filter(IpblockStatus.name.in_(status))
-    descendants = descendants.order_by(Ipblock.prefix).all()
+    descendants = db.session.execute(descendants.order_by(Ipblock.prefix).statement).scalars().all()
     if descendants:
         Messages.warn('%s rounded to %s because no ipblock exists at %s with status %s'
                       % (ip, descendants[0].ip, ip, status_str))
@@ -4213,4 +4235,4 @@ def fast_count(query):
     # query.count() would use a subselect which is very slow in MySQL
     # return db.session.execute(query.statement.with_only_columns([func.count()]).order_by(None)).scalar()
     # FIXME: implement fas again
-    return query.count()
+    return db.session.execute(query.statement.with_only_columns([func.count()]).order_by(None)).scalar()

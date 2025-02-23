@@ -3,6 +3,7 @@ import uuid
 from flask import g, current_app, Blueprint
 from sqlalchemy import create_engine, text
 import click
+from sqlalchemy import select
 
 import dim.models
 from dim import db
@@ -60,7 +61,7 @@ def script(filename):
     '''Runs a SQL script'''
     with open(filename) as f:
         sql = f.read()
-    db.engine.execute(sql)
+    db.engine.execute(text(sql))
 
 
 @manage_db.cli.command('fix_ipv6')
@@ -76,14 +77,14 @@ def fix_ipv6(s):
 
 def update_output_rr_data():
     '''Update output records.content column to match new jdnssec-based format'''
-    for output in Output.query.filter(Output.plugin == Output.PDNS_DB):
+    for output in db.session.execute(select(Output).filter_by(plugin == Output.PDNS_DB)).scalars():
         engine = create_engine(output.db_uri)
         with engine.begin() as conn:
-            conn.execute("UPDATE records SET content=UPPER(content) WHERE type='TLSA'")
+            conn.execute(text("UPDATE records SET content=UPPER(content) WHERE type='TLSA'"))
             updates = []
-            for row in conn.execute("SELECT id, content FROM records WHERE type='AAAA'"):
-                updates.append({"id": row.id,
-                               "content": fix_ipv6(row.content)})
+            for row in conn.execute(text("SELECT id, content FROM records WHERE type='AAAA'")):
+                updates.append({"id": row[0],
+                               "content": fix_ipv6(row[1])})
             conn.execute(text("UPDATE records SET content=:content WHERE id=:id"), updates)
 
 
@@ -97,22 +98,22 @@ def migrate_new_pdns():
         new_tid()
         update_output_rr_data()
         # Migrate zone-aliases
-        for alias in dim.models.db.session.execute('SELECT name, zone_id FROM zonealias'):
+        for alias in dim.models.db.session.execute(text('SELECT name, zone_id FROM zonealias')):
             new_tid()
-            aliased_zone = dim.models.db.session.query(Zone).filter_by(id=alias.zone_id).one()
-            zone = Zone.create(alias.name, attributes=aliased_zone.get_attrs(), owner=aliased_zone.owner)
+            aliased_zone = dim.models.db.session.execute(select(Zone).filter_by(id=alias[1])).scalar_one()
+            zone = Zone.create(alias[0], attributes=aliased_zone.get_attrs(), owner=aliased_zone.owner)
             ZoneView.create(zone, aliased_zone.views[0].name, from_profile=aliased_zone)
             for group in aliased_zone.views[0].groups:
                 group.views.append(zone.views[0])
                 for output in group.outputs:
                     OutputUpdate.send_create_view(zone.views[0], output, OutputUpdate.REFRESH_ZONE)
         # Set nsec3param algorithm to 1 (was incorrectly set to 8 previously)
-        for zone in Zone.query.all():
+        for zone in db.session.execute(select(Zone)).scalars():
             new_tid()
             zone.set_validity()
             if zone.nsec3_algorithm is not None:
                 zone.set_nsec3params(1, zone.nsec3_iterations, zone.nsec3_salt)
-        dim.models.db.session.execute('drop table zonealias')
+        dim.models.db.session.execute(text('drop table zonealias'))
         dim.models.db.session.commit()
 
 
@@ -121,7 +122,7 @@ def migrate_pdns_databases():
     '''Adds the records.rev_name column to each pdns output database'''
     with current_app.test_request_context():
         new_tid()
-        for output in Output.query.all():
+        for output in db.session.execute(select(Output)).scalars():
             if output.plugin != Output.PDNS_DB:
                 continue
             engine = create_engine(output.db_uri)

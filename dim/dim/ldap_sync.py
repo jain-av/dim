@@ -1,11 +1,11 @@
-
-
 import logging
 import sys
 
 import ldap3
 import ssl
 from flask import current_app as app
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from dim import db
 from dim.models import Group, User, GroupMembership, Department
@@ -67,7 +67,7 @@ class LDAP(object):
 
 def sync_departments(ldap: LDAP, deletion_threshold: int = -1, ignore_deletion_threshold: bool = False):
     '''Update the department table'''
-    db_departments = Department.query.all()
+    db_departments = db.session.execute(select(Department)).scalars().all()
     ldap_departments = dict((dep.department_number, dep) for dep in ldap.departments())
     # handle renamed or deleted departments
     for ddep in db_departments:
@@ -104,7 +104,7 @@ def check_deletion_threshold(instance_type: type, threshold: int = -1):
 
 def sync_users(ldap: LDAP, deletion_threshold: int = -1, ignore_deletion_threshold: bool = False):
     '''Update the user table ldap_cn, ldap_uid and department_number fields'''
-    db_users = User.query.all()
+    db_users = db.session.execute(select(User)).scalars().all()
     ldap_users = dict((u.username, u)
                       for u in ldap.users('(|%s)' % ''.join('(o=%s)' % u.username for u in db_users)))
     for db_user in db_users:
@@ -150,21 +150,23 @@ def ldap_sync(ignore_deletion_threshold: bool = False, cleanup_department_groups
 
     # Synchronize group members
     ldap_users = {}  # map department_number to list of usernames
-    for group in Group.query.filter(Group.department_number != None).all():  # noqa
+    stmt = select(Group).filter(Group.department_number != None)
+    for group in db.session.execute(stmt).scalars().all():
         search_results = ldap.departments('(ou=%s)' % group.department_number)
         if len(search_results) == 0:
             group.department_number = None
             log_stdout('Department %s %s was deleted and had the following members from LDAP: %s' % (
                 group.department_number,
                 group.name,
-                ' '.join(gm.user.username for gm in GroupMembership.query
+                ' '.join(gm.user.username for gm in db.session.execute(select(GroupMembership)
                          .filter(GroupMembership.from_ldap)
-                         .filter(GroupMembership.group == group).all())))
+                         .filter(GroupMembership.group == group)).scalars().all())))
         else:
             dept = search_results[0]
             if dept.name != group.name:
                 new_name = dept.name
-                if Group.query.filter(Group.name == new_name).count():
+                stmt = select(Group).filter(Group.name == new_name)
+                if db.session.execute(stmt).scalars().count():
                     # DIM-209 append id to department name to generate an unique user group name
                     new_name += '_%s' % dept.department_number
                 logging.info('Renaming group %s to %s' % (group.name, new_name))
@@ -172,7 +174,7 @@ def ldap_sync(ignore_deletion_threshold: bool = False, cleanup_department_groups
             ldap_users[group.department_number] = \
                 [u.username for u in ldap.users('(departmentNumber=%s)' % dept.department_number)]
     # Remove all users added by a ldap query that are no longer present in the group
-    for membership in GroupMembership.query.filter(GroupMembership.from_ldap).all():  # noqa
+    for membership in db.session.execute(select(GroupMembership).filter(GroupMembership.from_ldap)).scalars().all():
         if membership.group.department_number is None or \
            membership.user.username not in ldap_users[membership.group.department_number]:
             logging.info('User %s was removed from group %s' %
@@ -180,16 +182,18 @@ def ldap_sync(ignore_deletion_threshold: bool = False, cleanup_department_groups
             membership.group.remove_user(membership.user)
     # Remove users in department user-groups, that have not been added via ldap
     if cleanup_department_groups:
-        for membership in GroupMembership.query.filter(GroupMembership.from_ldap == False).filter(Group.department_number != None).filter(GroupMembership.usergroup_id==Group.id).all():
+        filter_expr = (GroupMembership.from_ldap == False) & (Group.department_number != None) & (GroupMembership.usergroup_id==Group.id)
+        stmt = select(GroupMembership).filter(filter_expr)
+        for membership in db.session.execute(stmt).scalars().all():
             if membership.user.username not in ldap_users[membership.group.department_number]:
                 logging.info(f'User {membership.user.username} was removed from department group {membership.group.name} ({membership.group.department_number}) as the membership was not from LDAP')
                 membership.group.remove_user(membership.user)
 
     # Add new users to groups
-    for group in Group.query.filter(Group.department_number != None).all():  # noqa
+    for group in db.session.execute(db.select(Group).filter(Group.department_number != None)).scalars().all():  # noqa
         group_users = set([u.username for u in group.users])
         for username in [u for u in ldap_users[group.department_number] if u not in group_users]:
-            user = User.query.filter_by(username=username).first()
+            user = db.session.execute(db.select(User).filter_by(username=username)).scalar_one_or_none()
             if user is None:
                 ldap_search = ldap.users('(o=%s)' % username)
                 if ldap_search:

@@ -70,9 +70,9 @@ class IPNodeData(object):
 class IPTrie(Trie):
     def __init__(self, version):
         if version == 4:
-            Trie.__init__(self, 32)
+            super().__init__(32)
         elif version == 6:
-            Trie.__init__(self, 128)
+            super().__init__(128)
         else:
             raise Exception('Unknown IP version')
         self._version = version
@@ -83,22 +83,22 @@ class IPTrie(Trie):
 
     def insert(self, ip, data):
         assert ip.version == self._version
-        return Trie.find(self, ip.address, ip.prefix, data=IPNodeData(ip, data), update=True)[1]
+        return super().find(self, ip.address, ip.prefix, data=IPNodeData(ip, data), update=True)[1]
 
     def delete(self, ip):
         assert ip.version == self._version
-        Trie.find(self, ip.address, ip.prefix, data=None, update=True)
+        super().find(self, ip.address, ip.prefix, data=None, update=True)
 
     def delete_subtree(self, ip):
-        Trie.find(self, ip.address, ip.prefix, delete=True)
+        super().find(self, ip.address, ip.prefix, delete=True)
 
     def parent(self, ip):
         assert ip.version == self._version
-        return Trie.find(self, ip.address, ip.prefix)[1]
+        return super().find(self, ip.address, ip.prefix)[1]
 
     def find(self, ip):
         assert ip.version == self._version
-        return Trie.find(self, ip.address, ip.prefix)[0]
+        return super().find(self, ip.address, ip.prefix)[0]
 
     def dump(self):
         lines = []

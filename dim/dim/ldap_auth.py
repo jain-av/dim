@@ -21,7 +21,11 @@ def check_credentials(username: str, password: str):
         user_dn += "," + app.config['LDAP_SEARCH_BASE']
 
     conn = ldap3.Connection(ldap_server, user=user_dn, password=password, client_strategy=ldap3.SAFE_SYNC)
-    (status, result, response, request) = conn.bind()
+    try:
+        status = conn.bind()
+    except ldap3.core.exceptions.LDAPBindError as e:
+        status = False
+        logging.info('LDAP login for user %s failed: %s', username, str(e))
     if not status:
-        logging.info('LDAP login for user %s failed: %s', username, result)
+        logging.info('LDAP login for user %s failed', username)
     return status
