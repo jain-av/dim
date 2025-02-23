@@ -32,6 +32,236 @@ from dimclient import DimClient
 from tests.pdns_util import diff_files, test_pdns_output_process, setup_pdns_output, compare_dim_pdns_zones
 
 from typing import List
+from sqlalchemy import create_engine
+
+
+topdir = os.path.dirname(os.path.abspath(__file__))
+T_DIR = os.path.join(topdir, 't')
+OUT_DIR = os.getenv('TEST_OUTPUT_DIR', os.path.join(topdir, 'out'))
+SRVLOG = os.getenv('SRVLOG', os.path.join(topdir, 'log/server.log'))
+
+PDNS1_DB_SERVER = os.getenv('PDNS1_DB_SERVER', '127.0.0.1')
+PDNS1_DB_PORT = os.getenv('PDNS1_DB_PORT', '3307')
+PDNS1_DB_NAME = os.getenv('PDNS1_DB_NAME', 'pdns1')
+PDNS1_DB_USER = os.getenv('PDNS1_DB_USER', 'pdns1')
+PDNS1_DB_PW = os.getenv('PDNS1_DB_PW', 'pdns')
+PDNS1_DB_URI = f'mysql://{PDNS1_DB_USER}:{PDNS1_DB_PW}@{PDNS1_DB_SERVER}:{PDNS1_DB_PORT}/{PDNS1_DB_NAME}'
+PDNS1_ADDRESS = '127.1.1.1'
+
+PDNS2_DB_SERVER = os.getenv('PDNS2_DB_SERVER', '127.0.0.1')
+PDNS2_DB_PORT = os.getenv('PDNS2_DB_PORT', '3307')
+PDNS2_DB_NAME = os.getenv('PDNS2_DB_NAME', 'pdns2')
+PDNS2_DB_USER = os.getenv('PDNS2_DB_USER', 'pdns2')
+PDNS2_DB_PW = os.getenv('PDNS2_DB_PW', 'pdns')
+PDNS2_DB_URI = f'mysql://{PDNS2_DB_USER}:{PDNS2_DB_PW}@{PDNS2_DB_SERVER}:{PDNS2_DB_PORT}/{PDNS2_DB_NAME}'
+
+DIM_DB_SERVER = os.getenv('DIM_DB_SERVER', '127.0.0.1')
+DIM_DB_PORT = os.getenv('DIM_DB_PORT', '3307')
+DIM_DB_NAME = os.getenv('DIM_DB_NAME', 'dim')
+DIM_DB_USER = os.getenv('DIM_DB_USER', 'dim')
+DIM_DB_PW = os.getenv('DIM_DB_PW', 'dim')
+
+
+NDCLI_SERVER = os.getenv('NDCLI_SERVER', 'http://localhost:5000')
+
+DIM_MYSQL_OPTIONS = f'-h{DIM_DB_SERVER} -P{DIM_DB_PORT} -u{DIM_DB_USER} -p{DIM_DB_PW} {DIM_DB_NAME}'
+DIM_MYSQL_COMMAND = 'mysql ' + DIM_MYSQL_OPTIONS
+VFLASK = os.getenv('VFLASK', 'flask')
+
+
+server = None
+pdns_output_proc = None
+
+
+class PDNSOutputProcess(object):
+    def __init__(self, needed):
+        self.needed = needed
+
+    def __enter__(self):
+        if self.needed:
+            self.proc = test_pdns_output_process(False)
+        return self
+
+    def __exit__(self, *args):
+        if self.needed:
+            self.proc.kill()
+            self.proc = None
+
+    def wait_updates(self):
+        '''Wait for all updates to be processed'''
+        if self.needed:
+            while True:
+                out = Popen(DIM_MYSQL_COMMAND, shell=True, stdin=PIPE, stdout=PIPE)\
+                      .communicate(input='SELECT COUNT(*) FROM outputupdate')[0]
+                if int(out.split()[1]) == 0:
+                    break
+                else:
+                    os.read(self.proc.stdout.fileno(), 1024)
+
+
+def is_ignorable(line: bytes):
+    return len(line.strip()) == 0 or line.startswith(b'#')
+
+
+def generates_table(line: bytes):
+    return (line.startswith(b'$ ndcli list') and not line.startswith(b'$ ndcli list containers')) \
+        or line.startswith(b'$ ndcli dump zone') or line.startswith(b'$ ndcli history')
+
+
+def generates_map(line: bytes):
+    return line.startswith(b'$ ndcli show') or line.startswith(b'$ ndcli modify rr') \
+        or re.search(b'(get|mark) (ip|delegation)', line) or re.search(b'ndcli create rr .* from', line)
+
+
+def is_pdns_query(line: bytes):
+    return any(cmd in line for cmd in (b'dig', b'drill'))
+
+
+def _ndcli(cmd: List[str], cmd_input=None):
+    proc = Popen(['ndcli' , '-s', NDCLI_SERVER] + cmd, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
+    out, err = proc.communicate(input=cmd_input if cmd_input != None else None)
+    return out
+
+
+def clean_database():
+    commands = [
+        f'echo "delete from domains; delete from records;" | mysql -h{PDNS1_DB_SERVER} -P{PDNS1_DB_PORT} -u{PDNS1_DB_USER} -p{PDNS1_DB_PW} {PDNS1_DB_NAME}',
+        f'echo "delete from domains; delete from records;" | mysql -h{PDNS2_DB_SERVER} -P{PDNS2_DB_PORT} -u{PDNS2_DB_USER} -p{PDNS2_DB_PW} {PDNS2_DB_NAME}',
+    ]
+    clean_sql = os.path.join(OUT_DIR, 'clean.sql')
+    if not hasattr(clean_database, 'dumped'):
+        commands.extend([
+            "echo 'drop database dim; create database dim;' | " + DIM_MYSQL_COMMAND,
+            '{} db clear'.format(VFLASK),
+            'mysqldump ' + DIM_MYSQL_OPTIONS + ' >' + clean_sql])
+        clean_database.dumped = True
+    else:
+        commands.extend([DIM_MYSQL_COMMAND + ' <' + clean_sql])
+    if os.system(';'.join(commands)) != 0:
+        sys.exit(1)
+
+
+def run_command(line: bytes, cmd_input=None):
+    cmd = shlex.split(line[7:].decode('utf-8'))
+    out = _ndcli(cmd, cmd_input)
+    return out
+
+
+def run_system_command(*args, **kwargs):
+    kwargs.setdefault('shell', True)
+    kwargs['close_fds'] = True
+    kwargs['stdout'] = PIPE
+    kwargs['stderr'] = PIPE
+    sp = Popen(*args, **kwargs)
+    stdout, stderr = sp.communicate()
+    return stdout.splitlines() + stderr.splitlines()
+
+
+def process_command(actual_output, expected_output, out, sort_before=False):
+    passed = True
+    if sort_before:
+        actual_output.sort()
+        expected_output.sort()
+    for actual, expected in zip_longest(actual_output, expected_output, fillvalue=''):
+        expected = expected.strip('\n')
+        if expected.endswith(' re'):
+            if re.match(expected[:-3], actual):
+                out.write(expected + '\n')
+            else:
+                out.write(actual + b'\n')
+                passed = False
+        else:
+            out.write(actual + b'\n')
+            if (actual != expected):
+                passed = False
+    return passed
+
+
+def table_from_lines(lines: List[bytes], cmd: bytes) -> List[List[bytes]]:
+    if generates_map(cmd):
+        result = []
+        for line in lines:
+            if not is_ignorable(line):
+                result.append(line.split(b':', 1))
+        return result
+    elif b' -H' in cmd or b'dump zone' in cmd:
+        result = []
+        for line in lines:
+            if is_ignorable(line):
+                continue
+            result.append(line.split(b'\t'))
+        return result
+    else:
+        result = []
+        while lines and is_ignorable(lines[0]):
+            lines.pop(0)
+        if not lines:
+            return result
+        while lines and re.match(b'^(INFO|WARNING)', lines[0]):
+            result.append([lines.pop(0)])
+        headers = lines[0].split()
+        offsets: List[int] = []
+        for header in headers:
+            # some headers are substrings of others
+            start_find = offsets[-1] + 1 if offsets else 0
+            offsets.append(lines[0].find(header, start_find))
+        for line in lines:
+            if is_ignorable(line):
+                continue
+            row = [b''] * len(offsets)
+            for col, offset in enumerate(offsets):
+                if offset < len(line):
+                    next_offset = len(line)
+                    if col < len(offsets) - 1:
+                        next_offset = min(offsets[col + 1], len(line))
+                    row[col] = line[offset:next_offset].strip()
+            result.append(row)
+        return result
+
+
+def add_regex(table, cmd):
+    def check_regexes(table, regexes):
+        regexes = [re.compile(r) for r in regexes]
+        for row in table:
+            for regex in regexes:
+                if re.search(regex, row[0]):
+                    row[0] = regex
+                    break
+
+#!/usr/bin/env python
+'''
+This script will run the tests from the requirements repository (from t/) and
+output the result of the run in the same format (into out/).
+
+Usage: ./runtest.py [-x] [<test> ...]
+
+If no tests are specified, all tests found in t/ will be run.
+
+-x will cause the testing to stop at the first failure
+
+-p automatically add zones to a pdns output (for every test where outputs are not used) and compare
+   dim and pdns for every zone change (exiting if a difference is detected)
+'''
+
+
+import configparser
+import errno
+import logging
+import os.path
+import re
+import shlex
+import sys
+from urllib.parse import urlparse
+from io import StringIO
+from itertools import zip_longest
+from subprocess import Popen, PIPE, DEVNULL, STDOUT
+
+from dimcli import CLI, config
+from dimclient import DimClient
+
+from tests.pdns_util import diff_files, test_pdns_output_process, setup_pdns_output, compare_dim_pdns_zones
+
+from typing import List
 
 
 topdir = os.path.dirname(os.path.abspath(__file__))
@@ -284,9 +514,9 @@ def match_table(actual_table, expected_table, actual_raw, expected_raw) -> List[
         if len(row) != len(info):
             return False
         for i, should in enumerate(info):
-            if type(should) == bytes and should != row[i]:
+            if isinstance(should, bytes) and should != row[i]:
                 return False
-            elif type(should) != bytes and re.match(should, row[i]) is None:
+            elif not isinstance(should, bytes) and re.match(should, row[i]) is None:
                 return False
         return True
 
