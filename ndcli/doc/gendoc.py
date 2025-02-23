@@ -4,8 +4,7 @@ import os
 # to find its corresponding dimcli module
 ndcli_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ndcli_path)
-from dimcli import cmd
-
+from dimcli import cli
 
 def options(opt_list):
     for opt in opt_list:
@@ -22,22 +21,22 @@ def print_options(opt_list):
         print('%-23s' % name, help)
 
 
-def command_leaves(cmd):
-    if cmd.subcommands:
-        for sub in sorted(cmd.subcommands, key=lambda s: s.name):
+def command_leaves(cli):
+    if cli.subcommands:
+        for sub in sorted(cli.subcommands, key=lambda s: s.name):
             for leaf, chain in command_leaves(sub):
-                yield leaf, [cmd] + chain
+                yield leaf, [cli] + chain
     else:
-        yield cmd, [cmd]
+        yield cli, [cli]
 
 
 def gendoc():
     print("Global Options\n==============\n")
-    print_options(cmd.options)
+    print_options(cli.options)
 
     print("\nCommands\n========\n")
-    for leaf, chain in command_leaves(cmd):
-        usage = cmd.chain_usage(chain)
+    for leaf, chain in command_leaves(cli):
+        usage = cli.chain_usage(chain)
         print(usage)
         print('-' * len(usage))
         if leaf.description or leaf.help:
