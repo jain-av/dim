@@ -4,6 +4,7 @@ from dim import db
 from dim.errors import PermissionDeniedError, InvalidGroupError, DimError
 from dim.models import User
 from tests.util import DatabaseTest, raises
+from sqlalchemy import select
 
 
 class RightsTest(DatabaseTest):
@@ -256,7 +257,6 @@ class RightsMatrixTest(DatabaseTest):
     def test_dual_admin(self):
         '''user with both dns_admin and network_admin can grant ip rights'''
         self.admin.ippool_create('pool')
-        self.admin.group_create('group')
         netdns = rpc.TRPC('netdns')
         netdns.group_grant_access('group', 'allocate', 'pool')
 

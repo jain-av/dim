@@ -29,7 +29,7 @@ class DatabaseTest(unittest.TestCase):
 
     def tearDown(self):
         db.session.remove()
-        db.get_engine(self.app).dispose()
+        db.dispose(self.app)
         self.ctx.pop()
 
     # taken from unittest/python 2.7
@@ -71,5 +71,5 @@ class RPCTest(DatabaseTest):
 
 
 def query_ip(ip_str):
-    layer3domain = Layer3Domain.query.first()
+    layer3domain = db.session.execute(db.select(Layer3Domain)).scalars().first()
     return Ipblock.query_ip(IP(ip_str), layer3domain)

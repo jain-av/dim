@@ -3,6 +3,8 @@ from dim.models import Zone, RegistrarAction
 from dim.autodns3 import get_action_keys
 from dim.errors import DimError
 from tests.util import RPCTest, raises
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 
 class Autodns3Test(RPCTest):
