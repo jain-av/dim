@@ -1,4 +1,5 @@
 from sqlalchemy import Column, BigInteger, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
 
 from dim import db
 
@@ -10,10 +11,11 @@ SCHEMA_VERSION = '12'
 
 
 class SchemaInfo(db.Model):
-    id = Column(BigInteger, primary_key=True, nullable=False)
-    version = Column(String(255), nullable=False, unique=True)
-    info = Column(Text)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, nullable=False)
+    version: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    info: Mapped[str] = mapped_column(Text, nullable=True)  # Text can be None
 
     @staticmethod
     def current_version():
-        return SchemaInfo.query.one().version
+        # Assuming db.session is available in the 'db' object
+        return db.session.execute(db.select(SchemaInfo).limit(1)).scalar_one().version

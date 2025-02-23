@@ -2,10 +2,268 @@ import datetime
 import logging
 from collections import namedtuple
 
+import sqlalchemy as sa
+import sqlalchemy.sql.expression as sql_expression
+from sqlalchemy.dialects.mysql import TIMESTAMP
+from sqlalchemy import event, desc, Column, Index, Integer, Numeric, BigInteger, String
+from sqlalchemy.orm import mapper, Mapped
+from sqlalchemy.orm.attributes import NO_VALUE
+from sqlalchemy.orm.properties import ColumnProperty
+from sqlalchemy.sql.expression import literal, union_all
+
+from dim.ipaddr import IP
+from dim.models import (db, get_session_username, get_session_tool,
+                        get_session_ip_address, get_session_ip_version, Pool, Ipblock, Zone, ZoneView,
+                        RR, Output, ZoneGroup, Group, GroupRight, GroupMembership, RegistrarAccount, ZoneKey,
+                        Layer3Domain)
+
+
+AttrChange = namedtuple('AttrChange', ['name', 'new_value', 'old_value'])
+
+
+# Register history events
+@event.listens_for(mapper, 'after_insert')
+def insert_listener(mapper, connection, target):
+    # Hack for group membership history
+    # (can't use collection events for backref or associationproxy)
+    if type(target) == GroupMembership:
+        make_history(target.group, 'added', collection_item=target.user)
+        return
+    action = 'created'
+    if type(target) == GroupRight:
+        action = 'granted'
+    if hasattr(target, '_changed_attrs'):
+        del target._changed_attrs
+    make_history(target, action)
+
+
+@event.listens_for(mapper, 'before_delete')
+def delete_listener(mapper, connection, target):
+    # Hack for group membership history
+    if type(target) == GroupMembership:
+        try:
+            make_history(Group.query.filter(Group.id==target.usergroup_id).one(), 'removed', collection_item=target.user)
+        except:
+            logging.exception('Error logging removal of user %s from group %s', target.user, target.group)
+        return
+    action = 'deleted'
+    if type(target) == GroupRight:
+        action = 'revoked'
+    make_history(target, action)
+
+
+def collection_listener(action):
+    def _collection_listener(target, value, initiator):
+        make_history(target, action, collection_item=value)
+    return _collection_listener
+
+
+for collection in [ZoneGroup.views, Output.groups]:
+    event.listen(collection, 'append', collection_listener('added'))
+    event.listen(collection, 'remove', collection_listener('removed'))
+
+
+@event.listens_for(mapper, 'after_update')
+def update_listener(mapper, connection, target):
+    if hasattr(target, '_changed_attrs'):
+        changes = target._changed_attrs
+        for change in list(changes.values()):
+            if change.name == 'name':
+                make_history(target, 'renamed', {'name': change.old_value}, changed_attr=change)
+            else:
+                make_history(target, 'set_attr', changed_attr=change)
+        del target._changed_attrs
+
+
+def setattr_listener(target, value, oldvalue, initiator):
+    if not hasattr(target, '_changed_attrs'):
+        target._changed_attrs = {}
+    if oldvalue == NO_VALUE:
+        return
+    target._changed_attrs[initiator.key] = AttrChange(initiator.key, value, oldvalue)
+
+
+def generate_history_table(klass, extra_history_columns, class_attributes, suppress_events=None, fillers=None, indexes=None):
+    '''
+    Creates a history table.
+    *klass* The class to be historized.
+    *extra_history_columns* List of columns that will be part of the table.
+    *class_attributes* List of columns and relationships of *klass*.
+    A listener for the 'set' event will be registered for elements in the list unless they are also in the *suppress_events* list.
+    For those that are columns, a column will be created in the history table with the same name and type.
+    *suppress_events* List of column attributes which won't be registered to the 'set' event.
+    *fillers* Dictionary {column_name: filler}. Useful for columns created from *class_attributes*.
+    *indexes* List of indexes to be used for the table.
+    '''
+    def column_filler(column_name):
+        return lambda obj, **kwargs: getattr(obj, column_name, None)
+    columns = [Column('id', BigInteger, primary_key=True, nullable=False),
+               Column('timestamp', TIMESTAMP(fsp=6), index=True, nullable=False,
+                      default=datetime.datetime.utcnow, server_default='1970-01-02 00:00:01'),
+               Column('user', String(128), nullable=False, index=True, default=get_session_username),
+               Column('tool', String(64), nullable=True, default=get_session_tool),
+               Column('call_ip_version', Integer, nullable=True, default=get_session_ip_version),
+               Column('call_ip_address', Numeric(precision=40, scale=0), nullable=True, default=get_session_ip_address),
+               Column('action', String(32), nullable=False)]
+    for class_attr in class_attributes:
+        listen = True
+        if type(class_attr.property) == ColumnProperty:
+            filler = column_filler(class_attr.name)
+            if fillers is not None and class_attr.name in fillers:
+                filler = fillers[class_attr.name]
+            columns.append(Column(class_attr.name, class_attr.type, info={'filler': filler}))
+            if suppress_events is not None and (class_attr.name in [attr.name for attr in suppress_events]):
+                listen = False
+        if listen:
+            event.listen(class_attr, 'set', setattr_listener)
+    for column in extra_history_columns:
+        columns.append(column)
+        if 'filler' not in column.info:
+            column.info['filler'] = column_filler(column.name)
+    if indexes is not None:
+        columns += indexes
+    klass.history_table = sa.Table('history_' + klass.__tablename__, db.metadata, *columns, **db.Model.default_table_kwargs)
+
+
+def format(value):
+    if value is None:
+        return None
+    if hasattr(value, 'display_name'):
+        return value.display_name
+    return value
+
+
+def format_ip(value, version, prefix=None):
+    return IP(int(value), version=version, prefix=prefix).label() if value else None
+
+
+# fillers used with history columns
+def group_filler(obj, **kwargs):
+    try:
+        return Group.query.filter(Group.id==obj.usergroup_id).one().name
+    except:
+        return None
+
+
+def right_filler(obj, **kwargs):
+    try:
+        return obj.accessright.access
+    except:
+        return None
+
+
+def object_filler(obj, **kwargs):
+    def object_str(accessright):
+        if accessright.object_class == 'ZoneView':
+            view = ZoneView.query.filter(ZoneView.id==accessright.object_id).one()
+            return 'zone %s view %s' % (view.zone.display_name, view.name)
+        elif accessright.object_class == 'Zone':
+            zone = Zone.query.filter(Zone.id==accessright.object_id).one()
+            return zone.display_name
+        elif accessright.object_class == 'Ippool':
+            pool = Pool.query.filter(Pool.id==accessright.object_id).one()
+            return pool.name
+        return None
+    try:
+        return object_str(obj.accessright)
+    except:
+        return None
+
+
+def _collection_field_filler(attrname):
+    def filler(obj, **kwargs):
+        item = kwargs['collection_item']
+        if item is not None:
+            return getattr(item, attrname, None)
+        return None
+    return filler
+
+
+def zone_filler(obj, **kwargs):
+    item = kwargs['collection_item']
+    if item is not None:
+        return item.zone.display_name
+    return None
+
+
+def layer3domain_filler(obj, **kwargs):
+    if type(obj) == RR:
+        ipblock = obj.ipblock
+        if ipblock:
+            return ipblock.layer3domain.display_name
+    elif type(obj) == Ipblock:
+        return ipblock.layer3domain.display_name
+    return None
+
+
+itemname_filler = _collection_field_filler('name')
+
+
+def default_filler(attr):
+    return lambda obj, **kwargs: getattr(obj, attr).display_name if getattr(obj, attr) else None
+
+
+def attrname_filler(obj, **kwargs):
+    change = kwargs['changed_attr']
+    if change is not None:
+        return change.name
+    return None
+
+
+def newvalue_filler(obj, **kwargs):
+    change = kwargs['changed_attr']
+    if change is not None:
+        if type(obj) == Ipblock and change.name == 'gateway':
+            return format_ip(change.new_value, obj.version)
+        return format(change.new_value)
+    return None
+
+
+def oldvalue_filler(obj, **kwargs):
+    change = kwargs['changed_attr']
+    if change is not None:
+        if type(obj) == Ipblock and change.name == 'gateway':
+            return format_ip(change.old_value, obj.version)
+        return format(change.old_value)
+    return None
+
+
+def generate_attr_change_columns():
+    return [Column('attrname', String(256), info={'filler': attrname_filler}),
+            Column('newvalue', String(256), info={'filler': newvalue_filler}),
+            Column('oldvalue', String(256), info={'filler': oldvalue_filler})]
+
+
+generate_history_table(
+    Pool,
+    [Column('vlan', Integer, info={'filler': default_filler('vlan')}),
+     Column('layer3domain', String(128), info={'filler': default_filler('layer3domain')}),
+     Column('address', Numeric(precision=40, scale=0)),
+     Column('prefix', Integer)] +
+    generate_attr_change_columns(),
+    [Pool.name, Pool.version, Pool.description, Pool.vlan, Pool.layer3domain],
+    indexes=[Index('ix_name', 'name')])
+
+generate_history_table(
+    Ipblock,
+    [Column('status', String(64), info={'filler': default_filler('status')}),
+     Column('pool', String(128), info={'filler': default_filler('pool')}),
+     Column('layer3domain', String(128), info={'filler': default_filler('layer3domain')}),
+     Column('vlan', Integer, info={'filler': default_filler('vlan')})] +
+    generate_attr_change_columns(),
+    [Ipblock.version, Ipblock.address, Ipblock.prefix, Ipblock.priority, Ipblock.gateway,
+     Ipblock.status, Ipblock.pool, Ipblock.vlan, Ipblock.layer3domain],
+    suppress_events=[Ipblock.version, Ipblock.address, Ipblock.prefix],
+    indexes=[Index('ix_address_prefix_version', 'address', 'prefix', 'version')])
+
+import datetime
+import logging
+from collections import namedtuple
+
 import sqlalchemy.sql.expression as sql_expression
 from sqlalchemy.dialects.mysql import TIMESTAMP
 from sqlalchemy import select, event, desc, Column, Index, Integer, Numeric, BigInteger, String
-from sqlalchemy.orm import mapper
+from sqlalchemy.orm import mapper, Mapped, mapped_column
 from sqlalchemy.orm.attributes import NO_VALUE
 from sqlalchemy.orm.properties import ColumnProperty
 from sqlalchemy.sql.expression import literal, union_all
@@ -121,7 +379,7 @@ def generate_history_table(klass, extra_history_columns, class_attributes, suppr
             column.info['filler'] = column_filler(column.name)
     if indexes is not None:
         columns += indexes
-    klass.history_table = db.Table('history_' + klass.__tablename__, *columns, **db.Model.default_table_kwargs)
+    klass.history_table = db.Table('history_' + klass.__tablename__, db.metadata, *columns, **db.Model.default_table_kwargs)
 
 
 def format(value):
@@ -354,7 +612,7 @@ def make_history(target, action, overwrite_values=None, changed_attr=None, colle
             values[column.name] = filler(target, changed_attr=changed_attr, collection_item=collection_item)
     if overwrite_values is not None:
         values.update(overwrite_values)
-    db.session.execute(table.insert().values(**values))
+    db.session.execute(table.insert(), values)
 
 
 class SelectProxy(object):

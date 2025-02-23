@@ -8,6 +8,7 @@ from .dns import (Zone, ZoneView, RR, RRType, Output, OutputUpdate, ZoneGroup, #
                   ZoneKey, RegistrarAccount, RegistrarAction, FavoriteZoneView)
 from .rights import User, UserType, Group, AccessRight, GroupRight, GroupMembership, Department # noqa
 from .history import record_history # noqa
+from sqlalchemy import text
 
 
 def insert_default_data():
@@ -30,8 +31,8 @@ def insert_default_data():
 
 
 def clean_database():
-    db.session.execute('SET foreign_key_checks = 0')
+    db.session.execute(text('SET foreign_key_checks = 0'))
     for t in reversed(db.Model.metadata.sorted_tables):
         db.session.execute(t.delete())
-    db.session.execute('SET foreign_key_checks = 1')
+    db.session.execute(text('SET foreign_key_checks = 1'))
     insert_default_data()
