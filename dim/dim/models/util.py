@@ -3,6 +3,7 @@ import datetime
 from flask import g
 from sqlalchemy import Column, String, TIMESTAMP
 from sqlalchemy.orm import contains_eager
+from sqlalchemy import select
 
 from dim import db
 
@@ -48,13 +49,19 @@ class WithAttr(object):
             if name.startswith('-'):
                 raise Exception("Attribute names may not contain a leading '-'.")
 
-        existing_names = db.session.query(self.AttrNameClass)\
-            .filter(self.AttrNameClass.name.in_(keys)).all()
-        current = self.AttrClass.query\
-            .filter_by(**{self.attr_backref: self})\
-            .join(self.AttrNameClass)\
-            .options(contains_eager(self.AttrClass.name))\
-            .filter(self.AttrNameClass.name.in_(list(attributes.keys()))).all()
+        existing_names = db.session.execute(
+            select(self.AttrNameClass).where(self.AttrNameClass.name.in_(keys))
+        ).scalars().all()
+        
+        current_stmt = (
+            select(self.AttrClass)
+            .filter(**{self.attr_backref: self})
+            .join(self.AttrNameClass)
+            .options(contains_eager(self.AttrClass.name))
+            .filter(self.AttrNameClass.name.in_(list(attributes.keys())))
+        )
+        current = db.session.execute(current_stmt).scalars().all()
+
         names = dict((name.name, name) for name in existing_names)
         # Create missing AttrNames
         for name in set(keys) - set(names.keys()):
@@ -81,10 +88,15 @@ class WithAttr(object):
         from .history import record_history
         if not attribute_names:
             return
-        current = self.AttrClass.query\
-            .filter_by(**{self.attr_backref: self})\
-            .join(self.AttrNameClass)\
-            .filter(self.AttrNameClass.name.in_(attribute_names)).all()
+        
+        current_stmt = (
+            select(self.AttrClass)
+            .filter(**{self.attr_backref: self})
+            .join(self.AttrNameClass)
+            .filter(self.AttrNameClass.name.in_(attribute_names))
+        )
+        current = db.session.execute(current_stmt).scalars().all()
+
         for attr in current:
             db.session.delete(attr)
         self.update_modified()
@@ -92,9 +104,12 @@ class WithAttr(object):
             record_history(self, action='del_attr', attrname=attr)
 
     def get_attrs(self):
-        return dict(db.session.query(self.AttrNameClass.name, self.AttrClass.value)
-                    .filter(getattr(self.AttrClass, self.attr_backref) == self)
-                    .filter(self.AttrClass.name_id == self.AttrNameClass.id).all())
+        stmt = (
+            select(self.AttrNameClass.name, self.AttrClass.value)
+            .filter(getattr(self.AttrClass, self.attr_backref) == self)
+            .filter(self.AttrClass.name_id == self.AttrNameClass.id)
+        )
+        return dict(db.session.execute(stmt).all())
 
 
 class TrackChanges(object):

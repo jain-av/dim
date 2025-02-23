@@ -2,7 +2,8 @@ from contextlib import wraps
 
 from sqlalchemy import Column, Integer, BigInteger, Boolean, String, Text, ForeignKey, UniqueConstraint, or_, literal
 from sqlalchemy.ext.associationproxy import association_proxy
-from sqlalchemy.orm import relationship, backref
+from sqlalchemy.orm import relationship, backref, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase
 
 from dim import db
 from dim.errors import PermissionDeniedError, InvalidAccessRightError
@@ -10,9 +11,13 @@ from dim.models import TrackChanges, get_session_tool
 from dim.util import is_reverse_zone
 
 
+class Base(DeclarativeBase):
+    pass
+
+
 def _find_or_create(klass):
     def find_or_create(**kwargs):
-        o = klass.query.filter_by(**kwargs).first()
+        o = db.session.execute(db.select(klass).filter_by(**kwargs)).scalar_one_or_none()
         if not o:
             o = klass(**kwargs)
             db.session.add(o)
@@ -20,15 +25,15 @@ def _find_or_create(klass):
     return find_or_create
 
 
-class GroupMembership(db.Model):
+class GroupMembership(Base):
     __tablename__ = 'usergroupuser'
 
-    usergroup_id = Column(BigInteger, ForeignKey('usergroup.id'), primary_key=True)
-    user_id = Column(BigInteger, ForeignKey('user.id'), primary_key=True)
-    from_ldap = Column(Boolean, nullable=False)
+    usergroup_id: Mapped[BigInteger] = mapped_column(ForeignKey('usergroup.id'), primary_key=True)
+    user_id: Mapped[BigInteger] = mapped_column(ForeignKey('user.id'), primary_key=True)
+    from_ldap: Mapped[Boolean] = mapped_column(nullable=False)
 
-    user = relationship('User', uselist=False, backref=backref('group_membership', cascade='all, delete-orphan'))
-    group = relationship('Group', uselist=False, backref=backref('membership', cascade='all, delete-orphan', collection_class=set))
+    user: Mapped["User"] = relationship(uselist=False, backref=backref('group_membership', cascade='all, delete-orphan'))
+    group: Mapped["Group"] = relationship(uselist=False, backref=backref('membership', cascade='all, delete-orphan', collection_class=set))
 
     def __init__(self, user=None, group=None, from_ldap=False):
         self.user = user
@@ -36,20 +41,20 @@ class GroupMembership(db.Model):
         self.from_ldap = from_ldap
 
 
-class UserType(db.Model):
-    id = Column(BigInteger, primary_key=True, nullable=False)
-    name = Column(String(128), nullable=False, unique=True)
+class UserType(Base):
+    id: Mapped[BigInteger] = mapped_column(primary_key=True, nullable=False)
+    name: Mapped[String] = mapped_column(String(128), nullable=False, unique=True)
 
 
-class Group(db.Model, TrackChanges):
+class Group(Base, TrackChanges):
     __tablename__ = 'usergroup'
 
-    id = Column(BigInteger, primary_key=True, nullable=False)
+    id: Mapped[BigInteger] = mapped_column(primary_key=True, nullable=False)
     # when department_number is set, ldap_sync will update the group name to match the linked
     # department name
-    name = Column(String(128), nullable=False, unique=True)
+    name: Mapped[String] = mapped_column(String(128), nullable=False, unique=True)
     # when not null, this group is linked to an LDAP department
-    department_number = Column(Integer, nullable=True, unique=True)
+    department_number: Mapped[Integer] = mapped_column(Integer, nullable=True, unique=True)
 
     users = association_proxy('membership', 'user')
     rights = association_proxy('group_rights', 'accessright')
@@ -59,55 +64,71 @@ class Group(db.Model, TrackChanges):
 
     @property
     def is_network_admin(self):
-        return GroupRight.query.filter_by(group=self)\
-            .join(AccessRight).filter_by(access='network_admin').count() != 0
+        return db.session.execute(
+            db.select(GroupRight)
+            .filter_by(group=self)
+            .join(AccessRight)
+            .filter_by(access='network_admin')
+        ).scalar_one_or_none() is not None
 
     @property
     def is_dns_admin(self):
-        return GroupRight.query.filter_by(group=self)\
-            .join(AccessRight).filter_by(access='dns_admin').count() != 0
+        return db.session.execute(
+            db.select(GroupRight)
+            .filter_by(group=self)
+            .join(AccessRight)
+            .filter_by(access='dns_admin')
+        ).scalar_one_or_none() is not None
 
     @property
     def network_rights(self):
-        return GroupRight.query.filter_by(group=self).join(AccessRight)\
-            .filter(AccessRight.access.in_(AccessRight.grantable_by_network_admin)).count()
+        return db.session.execute(
+            db.select(GroupRight)
+            .filter_by(group=self)
+            .join(AccessRight)
+            .filter(AccessRight.access.in_(AccessRight.grantable_by_network_admin))
+        ).scalars().all()
 
     @property
     def dns_rights(self):
-        return GroupRight.query.filter_by(group=self).join(AccessRight)\
-            .filter(AccessRight.access.in_(AccessRight.grantable_by_dns_admin)).count()
+        return db.session.execute(
+            db.select(GroupRight)
+            .filter_by(group=self)
+            .join(AccessRight)
+            .filter(AccessRight.access.in_(AccessRight.grantable_by_dns_admin))
+        ).scalars().all()
 
     def remove_user(self, user):
         self.users.remove(user)
 
 
-class Department(db.Model):
+class Department(Base):
     '''This table only serves as a cache of the departments available in LDAP'''
-    department_number = Column(Integer, primary_key=True)
-    name = Column(String(128), nullable=False)
+    department_number: Mapped[Integer] = mapped_column(Integer, primary_key=True)
+    name: Mapped[String] = mapped_column(String(128), nullable=False)
 
 
-class GroupRight(db.Model):
-    __table_constraints__ = (UniqueConstraint('usergroup_id', 'accessright_id'), )
+class GroupRight(Base):
+    __table_args__ = (UniqueConstraint('usergroup_id', 'accessright_id'), )
 
-    id = Column(BigInteger, primary_key=True, nullable=False)
-    accessright_id = Column(BigInteger, ForeignKey('accessright.id'))
-    usergroup_id = Column(BigInteger, ForeignKey('usergroup.id'))
+    id: Mapped[BigInteger] = mapped_column(primary_key=True, nullable=False)
+    accessright_id: Mapped[BigInteger] = mapped_column(ForeignKey('accessright.id'))
+    usergroup_id: Mapped[BigInteger] = mapped_column(ForeignKey('usergroup.id'))
 
-    group = relationship(Group, backref=backref('group_rights', collection_class=set, cascade='all, delete-orphan'))
-    accessright = relationship('AccessRight', uselist=False, backref=backref('grouprights', cascade='all, delete-orphan'))
+    group: Mapped["Group"] = relationship(Group, backref=backref('group_rights', collection_class=set, cascade='all, delete-orphan'))
+    accessright: Mapped["AccessRight"] = relationship('AccessRight', uselist=False, backref=backref('grouprights', cascade='all, delete-orphan'))
 
     def __init__(self, accessright):
         self.accessright = accessright
 
 
-class AccessRight(db.Model):
-    __table_constraints__ = (UniqueConstraint('access', 'object_class', 'object_id'), )
+class AccessRight(Base):
+    __table_args__ = (UniqueConstraint('access', 'object_class', 'object_id'), )
 
-    id = Column(BigInteger, primary_key=True, nullable=False)
-    access = Column(String(128), nullable=False)
-    object_class = Column(String(128), nullable=False)
-    object_id = Column(BigInteger, nullable=False)
+    id: Mapped[BigInteger] = mapped_column(primary_key=True, nullable=False)
+    access: Mapped[String] = mapped_column(String(128), nullable=False)
+    object_class: Mapped[String] = mapped_column(String(128), nullable=False)
+    object_id: Mapped[BigInteger] = mapped_column(BigInteger, nullable=False)
 
     groups = association_proxy('grouprights', 'group')
 
@@ -155,27 +176,27 @@ UserRights = dict(
     can_create_groups={'tool_access': False, 'access': [('dns_admin', None), ('network_admin', None)]})
 
 
-class User(db.Model):
+class User(Base):
     __tablename__ = 'user'
 
-    id = Column(BigInteger, primary_key=True, nullable=False)
-    user_type_id = Column(BigInteger, ForeignKey('usertype.id'))
-    username = Column(String(128), unique=True)  # same as the LDAP o attribute
-    preferences = Column(Text)
+    id: Mapped[BigInteger] = mapped_column(primary_key=True, nullable=False)
+    user_type_id: Mapped[BigInteger] = mapped_column(ForeignKey('usertype.id'))
+    username: Mapped[String] = mapped_column(String(128), unique=True)  # same as the LDAP o attribute
+    preferences: Mapped[Text] = mapped_column(Text)
 
     # LDAP fields
-    ldap_uid = Column(Integer, unique=True, nullable=True)
-    ldap_cn = Column(String(128), nullable=True)
-    department_number = Column(Integer, nullable=True)
+    ldap_uid: Mapped[Integer] = mapped_column(Integer, unique=True, nullable=True)
+    ldap_cn: Mapped[String] = mapped_column(String(128), nullable=True)
+    department_number: Mapped[Integer] = mapped_column(Integer, nullable=True)
 
     groups = association_proxy('group_membership', 'group')
 
-    user_type = relationship(UserType)
+    user_type: Mapped["UserType"] = relationship(UserType)
 
     def __init__(self, username, user_type='User', ldap_uid=None, ldap_cn=None, department_number=None,
                  register=True):
         self.username = username
-        self.user_type = UserType.query.filter_by(name=user_type).one()  # TODO enum
+        self.user_type = db.session.execute(db.select(UserType).filter_by(name=user_type)).scalar_one()  # TODO enum
         self.ldap_uid = ldap_uid
         self.ldap_cn = ldap_cn
         self.department_number = department_number
@@ -183,7 +204,7 @@ class User(db.Model):
             self.register()
 
     def register(self):
-        all_users = Group.query.filter_by(name='all_users').first()
+        all_users = db.session.execute(db.select(Group).filter_by(name='all_users')).scalar_one_or_none()
         if all_users is None:
             all_users = Group(name='all_users')
             db.session.add(all_users)
@@ -203,7 +224,11 @@ class User(db.Model):
             else:
                 class_name = dict(Pool='Ippool').get(obj.__class__.__name__, obj.__class__.__name__)
                 anylist.append(Group.rights.any(access=access, object_class=class_name, object_id=obj.id))
-        return Group.query.filter(Group.users.any(id=self.id)).filter(or_(*anylist)).count() != 0
+        return db.session.execute(
+            db.select(Group)
+            .filter(Group.users.any(id=self.id))
+            .filter(or_(*anylist))
+        ).scalar_one_or_none() is not None
 
     @permission
     def can_set_attribute(self, pool, attr):
@@ -211,12 +236,14 @@ class User(db.Model):
         is_dns_admin = self.has_any_access([('dns_admin', None)])
         if is_network_admin or is_dns_admin:
             return True
-        return Group.query.filter(Group.users.any(id=self.id)). \
+        return db.session.execute(
+            db.select(Group).filter(Group.users.any(id=self.id)). \
             join(GroupRight). \
             join(AccessRight).filter(
                 AccessRight.object_id == pool.id,
                 AccessRight.object_class == 'Ippool',
-                literal('attr.' + attr).like(AccessRight.access + '%')).count() != 0
+                literal('attr.' + attr).like(AccessRight.access + '%'))
+        ).scalar_one_or_none() is not None
 
 
     @property
