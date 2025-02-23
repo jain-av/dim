@@ -2,7 +2,7 @@ import json
 from http.cookiejar import LWPCookieJar
 from urllib.parse import urlencode
 from urllib.error import HTTPError
-from urllib.request import urlopen, Request, build_opener, HTTPCookieProcessor, HTTPSHandler
+from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPSHandler
 import logging
 import getpass
 import time
@@ -11,6 +11,7 @@ import os.path
 import ssl
 from pprint import pformat
 from . import version
+import urllib.request
 
 __version__ = version.VERSION
 
@@ -47,11 +48,13 @@ class DimClient(object):
 
     def login(self, username, password, permanent_session=False):
         try:
-            self.session.open(
+            req = urllib.request.Request(
                 self.server_url + '/login',
-                urlencode(dict(username=username, password=password, permanent_session=permanent_session)).encode('utf8'),
-                timeout=self.request_timeout,
+                data=urlencode(dict(username=username, password=password, permanent_session=permanent_session)).encode('utf8'),
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                method='POST'
             )
+            self.session.open(req, timeout=self.request_timeout)
             self.check_protocol_version()
             self._update_cookie_file()
             return True
@@ -125,7 +128,7 @@ class DimClient(object):
                                     id=None))
         logger.debug('dim call: %s(%s)' % (function, ', '.join([repr(x) for x in args])))
         start = time.time()
-        request = Request(url, data=json_call.encode('utf8'), headers={'Content-Type': 'application/json'})
+        request = urllib.request.Request(url, data=json_call.encode('utf8'), headers={'Content-Type': 'application/json'}, method='POST')
         response = self.session.open(request, timeout=self.request_timeout).read()
         rpc_response = json.loads(response.decode('utf8'))
         logger.debug('time taken: %.3f' % (time.time() - start))
@@ -166,4 +169,3 @@ class DimClient(object):
             options['limit'] -= len(batch)
             options['after'] = batch[-1]['ip']
         return result
-
